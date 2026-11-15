@@ -1,0 +1,10 @@
+services:
+  velair:
+    build: .
+    working_dir: /app
+    volumes:
+      - .:/app
+    env_file:
+      - path: .env
+        required: false
+    network_mode: host

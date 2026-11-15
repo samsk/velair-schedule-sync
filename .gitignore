@@ -1,0 +1,10 @@
+.env
+.ha_token
+backups/*.yaml
+!backups/.gitkeep
+__pycache__/
+*.pyc
+.pytest_cache/
+
+payloads/
+schedule*.yaml
