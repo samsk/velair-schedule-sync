@@ -61,6 +61,8 @@ class FakeHaState:
         steps: entity -> target_temp_step.
         revision: configuration revision.
         automations: id -> config.
+        labels: label_id -> registry entry.
+        entities: entity_id -> registry entry with labels.
         writes: mutating call log.
         turn_off_calls: switch entities turned off.
     """
@@ -94,6 +96,22 @@ class FakeHaState:
                 "triggers": [],
                 "conditions": [],
                 "actions": [{"action": "switch.turn_on"}],
+            },
+        }
+        self.labels: Dict[str, Dict[str, Any]] = {
+            "heating": {"label_id": "heating", "name": "heating", "icon": None},
+            "tuv": {"label_id": "tuv", "name": "tuv", "icon": "mdi:water-boiler"},
+        }
+        self.entities: Dict[str, Dict[str, Any]] = {
+            "automation.pool_heat_only_if_outdoor_at_least_5_c": {
+                "entity_id": "automation.pool_heat_only_if_outdoor_at_least_5_c",
+                "labels": ["heating"],
+                "unique_id": "pool_gate_velair",
+            },
+            "automation.tuv_charge": {
+                "entity_id": "automation.tuv_charge",
+                "labels": ["heating"],
+                "unique_id": "1760162526412",
             },
         }
         self.writes: List[str] = []
@@ -225,6 +243,27 @@ class FakeHaServer:
                         ],
                     )
                     return
+                if path == "/api/states":
+                    out: List[Dict[str, Any]] = []
+                    for eid, ent in state.entities.items():
+                        aid = ent.get("unique_id")
+                        out.append(
+                            {
+                                "entity_id": eid,
+                                "state": "on",
+                                "attributes": {
+                                    "id": aid,
+                                    "friendly_name": (
+                                        (state.automations.get(str(aid)) or {}).get(
+                                            "alias"
+                                        )
+                                        or eid
+                                    ),
+                                },
+                            }
+                        )
+                    self._json(200, out)
+                    return
                 if path.startswith("/api/states/"):
                     entity_id = path[len("/api/states/") :]
                     if entity_id in CLIMATES:
@@ -247,6 +286,26 @@ class FakeHaServer:
                                 "entity_id": entity_id,
                                 "state": "heat" if entity_id != "climate.hvac" else "fan_only",
                                 "attributes": attrs,
+                            },
+                        )
+                        return
+                    if entity_id in state.entities:
+                        ent = state.entities[entity_id]
+                        aid = ent.get("unique_id")
+                        self._json(
+                            200,
+                            {
+                                "entity_id": entity_id,
+                                "state": "on",
+                                "attributes": {
+                                    "id": aid,
+                                    "friendly_name": (
+                                        (state.automations.get(str(aid)) or {}).get(
+                                            "alias"
+                                        )
+                                        or entity_id
+                                    ),
+                                },
                             },
                         )
                         return
@@ -426,6 +485,82 @@ class FakeHaServer:
                                 "type": "result",
                                 "success": True,
                                 "result": state.schedule_payload(),
+                            },
+                        )
+                        continue
+                    if mtype == "config/label_registry/list":
+                        self._ws_send(
+                            sock,
+                            {
+                                "id": msg_id,
+                                "type": "result",
+                                "success": True,
+                                "result": list(state.labels.values()),
+                            },
+                        )
+                        continue
+                    if mtype == "config/label_registry/create":
+                        name = str(msg.get("name") or "")
+                        lid = name.lower().replace(" ", "_")
+                        entry = {
+                            "label_id": lid,
+                            "name": name,
+                            "icon": msg.get("icon"),
+                        }
+                        state.labels[lid] = entry
+                        state.writes.append(f"label_create {lid}")
+                        self._ws_send(
+                            sock,
+                            {
+                                "id": msg_id,
+                                "type": "result",
+                                "success": True,
+                                "result": entry,
+                            },
+                        )
+                        continue
+                    if mtype == "config/entity_registry/get":
+                        eid = str(msg.get("entity_id") or "")
+                        ent = state.entities.get(eid)
+                        if ent is None:
+                            self._ws_send(
+                                sock,
+                                {
+                                    "id": msg_id,
+                                    "type": "result",
+                                    "success": False,
+                                    "error": {
+                                        "code": "not_found",
+                                        "message": eid,
+                                    },
+                                },
+                            )
+                            continue
+                        self._ws_send(
+                            sock,
+                            {
+                                "id": msg_id,
+                                "type": "result",
+                                "success": True,
+                                "result": dict(ent),
+                            },
+                        )
+                        continue
+                    if mtype == "config/entity_registry/update":
+                        eid = str(msg.get("entity_id") or "")
+                        ent = state.entities.setdefault(
+                            eid, {"entity_id": eid, "labels": [], "unique_id": None}
+                        )
+                        if "labels" in msg:
+                            ent["labels"] = [str(x) for x in (msg.get("labels") or [])]
+                        state.writes.append(f"entity_labels {eid}")
+                        self._ws_send(
+                            sock,
+                            {
+                                "id": msg_id,
+                                "type": "result",
+                                "success": True,
+                                "result": dict(ent),
                             },
                         )
                         continue

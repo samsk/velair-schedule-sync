@@ -90,6 +90,12 @@ automations:
     fallback_script: script.pool_heating_off
   tuv_charge:
     id: '1760162526412'
+    alias: TUV Charge Low Tarif
+    entity: switch.charge
+    temp_sensor: sensor.sonoff_10018e421f_temperature
+    below_c: 45
+    labels:
+    - tuv
     triggers:
     - at: LT_workday+1:01
       weekday: [mon, tue, wed, thu, fri]

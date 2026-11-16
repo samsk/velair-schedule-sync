@@ -667,8 +667,137 @@ def cmd_apply(args: argparse.Namespace) -> int:
     return 0
 
 
+def _resolve_tuv_triggers(
+    cfg: ScheduleConfig, tuv: Dict[str, Any]
+) -> List[Dict[str, Any]]:
+    """Resolve tuv_charge time triggers from specifier tokens.
+
+    Args:
+        cfg: Config.
+        tuv: tuv_charge automation block.
+    Returns:
+        HA time trigger list.
+    """
+    clocks: Dict[str, List[str]] = {}
+    for trig in tuv.get("triggers") or []:
+        days = list(trig.get("weekday") or [])
+        for day, clock in resolve_automation_trigger(cfg, str(trig["at"]), days):
+            clocks.setdefault(clock, [])
+            if day not in clocks[clock]:
+                clocks[clock].append(day)
+    return [
+        {
+            "trigger": "time",
+            "at": clock if clock.count(":") == 2 else f"{clock}:00",
+            "weekday": days,
+        }
+        for clock, days in clocks.items()
+    ]
+
+
+def _yaml_label_specs(auto: Dict[str, Any]) -> List[Any]:
+    """Read optional labels list from an automation block.
+
+    Args:
+        auto: Automation yaml dict.
+    Returns:
+        Label specs (strings or maps).
+    """
+    return list(auto.get("labels") or [])
+
+
+def _ensure_label_id(client: HaClient, spec: Any, known: Dict[str, Dict[str, Any]]) -> str:
+    """Resolve one yaml label spec to a registry label_id, creating if needed.
+
+    Args:
+        client: HA client.
+        spec: String label_id or {name, icon} map.
+        known: label_id -> registry entry (updated in place).
+    Returns:
+        label_id.
+    """
+    if isinstance(spec, str):
+        label_id = spec
+        if label_id in known:
+            return label_id
+        by_name = {str(e.get("name") or ""): e for e in known.values()}
+        if label_id in by_name:
+            return str(by_name[label_id]["label_id"])
+        created = client.create_label(label_id)
+        lid = str(created.get("label_id") or label_id)
+        known[lid] = created
+        return lid
+
+    if isinstance(spec, dict):
+        name = str(spec.get("name") or "").strip()
+        if not name:
+            raise RuntimeError(f"label map needs name: {spec}")
+        icon = spec.get("icon")
+        by_name = {str(e.get("name") or ""): e for e in known.values()}
+        if name in by_name:
+            return str(by_name[name]["label_id"])
+        if name in known:
+            return name
+        created = client.create_label(name, icon=str(icon) if icon else None)
+        lid = str(created.get("label_id") or name)
+        known[lid] = created
+        return lid
+
+    raise RuntimeError(f"unsupported label spec: {spec!r}")
+
+
+def _apply_automation_labels(
+    client: HaClient,
+    automation_id: str,
+    auto: Dict[str, Any],
+    dry: bool,
+) -> None:
+    """Union existing, managed, and yaml labels onto an automation entity.
+
+    Args:
+        client: HA client.
+        automation_id: Automation unique id.
+        auto: Automation yaml block.
+        dry: Dry-run flag.
+    """
+    wanted_specs: List[Any] = ["managed", *_yaml_label_specs(auto)]
+    entity_id = client.find_automation_entity(str(automation_id))
+    existing: List[str] = []
+    if entity_id:
+        try:
+            existing = client.get_entity_labels(entity_id)
+        except Exception as exc:
+            print(f"labels {automation_id}: entity read failed: {exc}")
+            existing = []
+    else:
+        print(f"labels {automation_id}: entity not found yet")
+
+    if dry:
+        print(
+            f"labels {automation_id} entity={entity_id or '?'} "
+            f"existing={existing} add={wanted_specs}"
+        )
+        return
+
+    if not entity_id:
+        return
+
+    known = {str(e.get("label_id")): e for e in client.list_labels()}
+    if "managed" not in known:
+        created = client.create_label("managed")
+        known[str(created.get("label_id") or "managed")] = created
+
+    resolved = [str(x) for x in existing]
+    for spec in wanted_specs:
+        lid = _ensure_label_id(client, spec, known)
+        if lid not in resolved:
+            resolved.append(lid)
+    print(f"labels {automation_id} entity={entity_id} -> {resolved}")
+    client.set_entity_labels(entity_id, resolved)
+
+
 def _apply_automations(cfg: ScheduleConfig, client: HaClient, dry: bool) -> None:
-    """Upsert pool_gate and tuv_charge triggers.
+    """Upsert pool_gate and tuv_charge automations plus labels.
 
     Args:
         cfg: Config.
@@ -739,34 +868,61 @@ def _apply_automations(cfg: ScheduleConfig, client: HaClient, dry: bool) -> None
                     merged.pop(old, None)
                 merged.update(conf)
                 client.set_automation_config(str(aid), merged)
+            _apply_automation_labels(client, str(aid), pool, dry=False)
+        else:
+            _apply_automation_labels(client, str(aid or "pool_gate"), pool, dry=True)
 
     tuv = cfg.automations.get("tuv_charge") or {}
     aid = tuv.get("id")
     if aid:
         print(f"automation tuv_charge id={aid}")
-        clocks: Dict[str, List[str]] = {}
-        for trig in tuv.get("triggers") or []:
-            days = list(trig.get("weekday") or [])
-            for day, clock in resolve_automation_trigger(cfg, str(trig["at"]), days):
-                clocks.setdefault(clock, [])
-                if day not in clocks[clock]:
-                    clocks[clock].append(day)
-        new_triggers = [
-            {
-                "trigger": "time",
-                "at": clock if clock.count(":") == 2 else f"{clock}:00",
-                "weekday": days,
-            }
-            for clock, days in clocks.items()
-        ]
+        new_triggers = _resolve_tuv_triggers(cfg, tuv)
         print(f"tuv_charge triggers -> {new_triggers}")
+        entity = tuv.get("entity")
+        temp_sensor = tuv.get("temp_sensor")
+        below_c = tuv.get("below_c")
+        alias = tuv.get("alias", "TUV Charge Low Tarif")
+        full = entity and temp_sensor is not None and below_c is not None
+        if full:
+            conditions = [
+                {
+                    "condition": "numeric_state",
+                    "entity_id": temp_sensor,
+                    "below": below_c,
+                }
+            ]
+            actions = [
+                {
+                    "action": "switch.turn_on",
+                    "target": {"entity_id": entity},
+                }
+            ]
+            print(f"tuv_charge condition -> {conditions}")
+            print(f"tuv_charge action -> {actions}")
+        else:
+            conditions = None
+            actions = None
         if not dry:
-            existing = client.get_automation_config(str(aid))
+            try:
+                existing = client.get_automation_config(str(aid))
+            except Exception:
+                existing = None
             if not isinstance(existing, dict):
-                raise RuntimeError("tuv_charge config missing")
-            existing.pop("trigger", None)
+                existing = {"id": str(aid), "mode": "single"}
+                print(f"created tuv_charge id={aid}")
+            for old in ("trigger", "condition", "action"):
+                existing.pop(old, None)
+            existing["alias"] = alias
+            existing["mode"] = existing.get("mode") or "single"
             existing["triggers"] = new_triggers
+            if conditions is not None:
+                existing["conditions"] = conditions
+            if actions is not None:
+                existing["actions"] = actions
             client.set_automation_config(str(aid), existing)
+            _apply_automation_labels(client, str(aid), tuv, dry=False)
+        else:
+            _apply_automation_labels(client, str(aid), tuv, dry=True)
 
 
 def cmd_collect(args: argparse.Namespace) -> int:

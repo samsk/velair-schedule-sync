@@ -185,6 +185,81 @@ class HaClient:
             write=True,
         )
 
+    def find_automation_entity(self, automation_id: str) -> Optional[str]:
+        """Find automation entity_id by unique id attribute.
+
+        Args:
+            automation_id: Automation unique id.
+        Returns:
+            Entity id or None.
+        """
+        states = self.get("/api/states")
+        if not isinstance(states, list):
+            return None
+        for st in states:
+            if not isinstance(st, dict):
+                continue
+            eid = str(st.get("entity_id") or "")
+            if not eid.startswith("automation."):
+                continue
+            attrs = st.get("attributes") or {}
+            if str(attrs.get("id") or "") == str(automation_id):
+                return eid
+        return None
+
+    def list_labels(self) -> List[Dict[str, Any]]:
+        """List HA label registry entries.
+
+        Returns:
+            Label dicts.
+        """
+        result = self.ws_command("config/label_registry/list")
+        return list(result or [])
+
+    def create_label(self, name: str, *, icon: Optional[str] = None) -> Dict[str, Any]:
+        """Create one HA label.
+
+        Args:
+            name: Label display name (also becomes label_id when slug-safe).
+            icon: Optional mdi icon.
+        Returns:
+            Created label dict.
+        """
+        fields: Dict[str, Any] = {"name": name}
+        if icon:
+            fields["icon"] = icon
+        return self.ws_command("config/label_registry/create", fields, write=True) or {}
+
+    def get_entity_labels(self, entity_id: str) -> List[str]:
+        """Read labels for one entity.
+
+        Args:
+            entity_id: Entity id.
+        Returns:
+            Label ids.
+        """
+        entry = self.ws_command(
+            "config/entity_registry/get", {"entity_id": entity_id}
+        )
+        if not isinstance(entry, dict):
+            return []
+        return [str(x) for x in (entry.get("labels") or [])]
+
+    def set_entity_labels(self, entity_id: str, labels: List[str]) -> Any:
+        """Replace entity labels.
+
+        Args:
+            entity_id: Entity id.
+            labels: Full label id list.
+        Returns:
+            Registry update result.
+        """
+        return self.ws_command(
+            "config/entity_registry/update",
+            {"entity_id": entity_id, "labels": labels},
+            write=True,
+        )
+
     async def ws_statistics(
         self,
         statistic_ids: List[str],

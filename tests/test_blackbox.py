@@ -96,6 +96,26 @@ def test_apply_yes_stores_blocks_and_triggers(fake_ha: FakeHaServer, tmp_path: P
     triggers = tuv["triggers"]
     assert {"trigger": "time", "at": "23:01:00", "weekday": ["mon", "tue", "wed", "thu", "fri"]} in triggers
     assert {"trigger": "time", "at": "04:30:00", "weekday": ["sat", "sun"]} in triggers
+    assert tuv["conditions"] == [
+        {
+            "condition": "numeric_state",
+            "entity_id": "sensor.sonoff_10018e421f_temperature",
+            "below": 45,
+        }
+    ]
+    assert tuv["actions"] == [
+        {"action": "switch.turn_on", "target": {"entity_id": "switch.charge"}}
+    ]
+    tuv_labels = set(fake_ha.state.entities["automation.tuv_charge"]["labels"])
+    assert tuv_labels == {"heating", "managed", "tuv"}
+    assert "managed" in fake_ha.state.labels
+    pool_labels = set(
+        fake_ha.state.entities["automation.pool_heat_only_if_outdoor_at_least_5_c"][
+            "labels"
+        ]
+    )
+    assert "managed" in pool_labels
+    assert "heating" in pool_labels
 
     raw = yaml.safe_load(config.read_text())
     assert str(raw.get("backup", {}).get("last", "")).startswith("backups/")
