@@ -5,6 +5,7 @@ backups/*.yaml
 __pycache__/
 *.pyc
 .pytest_cache/
+.venv/
 
 payloads/
 schedule*.yaml

@@ -63,10 +63,13 @@ run via docker compose.
 make build
 make validate
 make show ARGS='--entity climate.hc1 --day weekday'
+make check              # offline pytest + fake HA blackbox
 make test
 make apply              # dry-run diff
 make apply-yes          # write to HA
 make collect ARGS='--since 2026-11-15'
+make ha-up              # optional local HA on 127.0.0.1:8123
+make test-ha            # smoke test; needs tests/ha.env (localhost only)
 make help
 ```
 
