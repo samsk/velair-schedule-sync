@@ -1,0 +1,98 @@
+version: 1
+context:
+  summary: blackbox fixture
+  collect_sensors: []
+specifiers:
+  LT_workday:
+    days: [mon, tue, wed, thu, fri]
+    start: '22:00'
+    end: 06:00
+  LT_weekday_night: LT_workday
+  LT_weekend_morning:
+    days: [sat, sun]
+    start: 02:30
+    end: 08:15
+  midday:
+    days: [mon, tue, wed, thu, fri, sat, sun]
+    start: '11:00'
+    end: '15:00'
+rules:
+  disable: null
+  user:
+  - id: aku_step
+    type: max_step_up
+    entities: [climate.hc1]
+    limit_c: 2.5
+    min_gap_minutes: 15
+schedules:
+  climate.hc1:
+    mode: 5/2
+    temp_step: 0.5
+    weekday:
+    - time: LT+2:00
+      temp: 15.5
+      hvac_mode: heat
+    - time: LT+4:00
+      temp: 18
+      hvac_mode: heat
+    - time: LT.end
+      temp: 15.5
+      hvac_mode: heat
+    weekend:
+    - time: 00:00
+      temp: 15.5
+      hvac_mode: heat
+    - time: LT_weekend_morning+3:00
+      temp: 20.5
+      hvac_mode: heat
+    - time: LT_weekend_morning.end
+      temp: 15.5
+      hvac_mode: heat
+  climate.hvac:
+    mode: 5/2
+    weekday:
+    - time: LT+2:00
+      temp: 18.5
+      preset_mode: home
+    - time: '18:00'
+      preset_mode: high
+    - time: '19:30'
+      temp: 18.5
+    weekend:
+    - time: 00:00
+      temp: 18.5
+      preset_mode: home
+    - time: '18:00'
+      preset_mode: high
+  climate.pool:
+    mode: 5/2
+    weekday: &pool_days
+    - time: 00:00
+      hvac_mode: 'off'
+    - time: midday+1:00
+      temp: 29
+      hvac_mode: heat
+    - time: midday+2:00
+      hvac_mode: 'off'
+    weekend: *pool_days
+groups: {}
+profiles: {}
+automations:
+  pool_gate:
+    id: pool_gate_velair
+    alias: Pool heat only if outdoor at least 5 C
+    entity: climate.pool
+    outdoor_sensor: sensor.outdoor_temperature
+    min_outdoor_c: 5
+    fallback_script: script.pool_heating_off
+  tuv_charge:
+    id: '1760162526412'
+    triggers:
+    - at: LT_workday+1:01
+      weekday: [mon, tue, wed, thu, fri]
+    - at: LT_weekend_morning+2:00
+      weekday: [sat, sun]
+legacy_disable:
+- switch.schedule_missing_legacy
+backup:
+  last: null

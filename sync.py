@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional
 
 import yaml
 
-from lib import cs_api
+from lib import cs_api, velair_api
 from lib.config import ScheduleConfig, climate_entities, load_config, save_config
 from lib.ha import HaClient, load_connection
 from lib.lint import exit_code, validate
@@ -36,6 +36,49 @@ REQUIRED_SERVICES = [
     ("climate_scheduler", "enable_schedule"),
     ("climate_scheduler", "sync_all"),
 ]
+VELAIR_SERVICES = [
+    ("velair", "apply_schedule"),
+    ("velair", "set_daily_schedule"),
+    ("velair", "activate_profile"),
+]
+
+
+def _service_names(raw: Any) -> set:
+    """Service names from an HA domain entry.
+
+    Args:
+        raw: `services` field: dict of names or list of `{service: ...}`.
+    Returns:
+        Service name set.
+    """
+    if isinstance(raw, dict):
+        return set(raw)
+    names = set()
+    if isinstance(raw, list):
+        for svc in raw:
+            if isinstance(svc, str):
+                names.add(svc)
+            elif isinstance(svc, dict) and svc.get("service"):
+                names.add(str(svc["service"]))
+    return names
+
+
+def _services_by_domain(payload: Any) -> Dict[str, set]:
+    """Map domain to service names from GET /api/services.
+
+    Args:
+        payload: HA services list.
+    Returns:
+        Domain -> names.
+    """
+    out: Dict[str, set] = {}
+    if not isinstance(payload, list):
+        return out
+    for item in payload:
+        if not isinstance(item, dict) or not item.get("domain"):
+            continue
+        out[str(item["domain"])] = _service_names(item.get("services"))
+    return out
 
 
 def _cfg(path: Optional[str]) -> ScheduleConfig:
@@ -61,15 +104,20 @@ def cmd_test(args: argparse.Namespace) -> int:
     client = load_connection(args.url, args.token, ROOT)
     client.allow_writes = False
     info = client.get_config()
-    version = info.get("version") or info
-    print(f"HA version: {version}")
-    services = client.get_services()
-    by_domain = {s["domain"]: {svc["service"] for svc in s.get("services", [])} for s in services}
-    for domain, service in REQUIRED_SERVICES:
+    print(f"HA version: {info.get('version') or info}")
+    by_domain = _services_by_domain(client.get_services())
+    required = REQUIRED_SERVICES
+    if "climate_scheduler" not in by_domain and "velair" in by_domain:
+        required = VELAIR_SERVICES
+        print("scheduler: velair (climate_scheduler not installed)")
+    missing = False
+    for domain, service in required:
         ok = service in by_domain.get(domain, set())
         print(f"service {domain}.{service}: {'ok' if ok else 'MISSING'}")
         if not ok:
-            return 1
+            missing = True
+    if missing:
+        return 1
     for ent in climate_entities(cfg):
         state = client.get_state(ent)
         if state is None:
@@ -149,15 +197,25 @@ def _backup_payload(cfg: ScheduleConfig, client: HaClient) -> Dict[str, Any]:
     for sw in cfg.legacy_disable:
         st = client.get_state(sw)
         snap["legacy_switches"][sw] = st
-    for key in schedule_keys(cfg):
+    if _uses_velair(client):
+        live = velair_api.fetch_schedule(client)
+        snap["velair_revision"] = live.get("configuration_revision")
+        snap["velair_global"] = live.get("global")
+        snap["velair_schedules"] = {
+            eid: (zone or {}).get("schedule")
+            for eid, zone in (live.get("zones") or {}).items()
+            if isinstance(zone, dict)
+        }
+    else:
+        for key in schedule_keys(cfg):
+            try:
+                snap["climate_schedules"][key] = cs_api.get_schedule(client, key)
+            except Exception as exc:
+                snap["climate_schedules"][key] = {"error": str(exc)}
         try:
-            snap["climate_schedules"][key] = cs_api.get_schedule(client, key)
+            snap["groups"] = cs_api.list_groups(client)
         except Exception as exc:
-            snap["climate_schedules"][key] = {"error": str(exc)}
-    try:
-        snap["groups"] = cs_api.list_groups(client)
-    except Exception as exc:
-        snap["groups_error"] = str(exc)
+            snap["groups_error"] = str(exc)
     for name, auto in cfg.automations.items():
         aid = auto.get("id")
         if not aid:
@@ -330,6 +388,176 @@ def _diff_nodes(desired: List[Dict[str, Any]], current: Any) -> List[str]:
     return lines
 
 
+def _note_backup(cfg: ScheduleConfig, rel: str) -> None:
+    """Record the latest backup path without rewriting the schedule file.
+
+    Args:
+        cfg: Config.
+        rel: Backup path relative to the repo.
+    """
+    lines = cfg.path.read_text().splitlines(keepends=True)
+    found = False
+    for index, line in enumerate(lines):
+        if line.startswith("  last:"):
+            lines[index] = f"  last: {rel}\n"
+            found = True
+            break
+    if not found:
+        if lines and not lines[-1].endswith("\n"):
+            lines[-1] += "\n"
+        lines.extend(["backup:\n", f"  last: {rel}\n"])
+    cfg.path.write_text("".join(lines))
+    cfg.raw.setdefault("backup", {})["last"] = rel
+
+
+def _revision_from(result: Any) -> Optional[int]:
+    """Read configuration_revision from a Velair service response.
+
+    Args:
+        result: HA service response.
+    Returns:
+        Revision, or None.
+    """
+    data = result
+    if isinstance(result, dict) and isinstance(result.get("service_response"), dict):
+        data = result["service_response"]
+    if isinstance(data, dict) and isinstance(data.get("configuration_revision"), int):
+        return int(data["configuration_revision"])
+    return None
+
+
+def _temp_step(
+    cfg: ScheduleConfig, key: str, desired: Dict[str, List[Dict[str, Any]]]
+) -> Optional[float]:
+    """Step Velair should use when snapping targets.
+
+    Args:
+        cfg: Config.
+        key: Schedule key.
+        desired: Day label -> nodes.
+    Returns:
+        Explicit temp_step, 0.5 when any target is fractional, or None.
+    """
+    raw = (cfg.schedules.get(key) or {}).get("temp_step")
+    if raw is not None:
+        return float(raw)
+    for nodes in desired.values():
+        for node in nodes:
+            temp = node.get("temp")
+            if isinstance(temp, (int, float)) and float(temp) % 1:
+                return 0.5
+    return None
+
+
+def _uses_velair(client: HaClient) -> bool:
+    """True when Velair is installed and Climate Scheduler is not.
+
+    Args:
+        client: HA client.
+    Returns:
+        Whether apply should use the Velair API.
+    """
+    domains = _services_by_domain(client.get_services())
+    return "velair" in domains and "climate_scheduler" not in domains
+
+
+def _velair_targets(cfg: ScheduleConfig, key: str, live: Dict[str, Any]) -> List[str]:
+    """Climate entities that receive one yaml schedule key.
+
+    Args:
+        cfg: Config.
+        key: climate.* or group:Name.
+        live: Velair schedule.
+    Returns:
+        Entity ids.
+    """
+    if not key.startswith("group:"):
+        return [key]
+    name = key.split(":", 1)[1]
+    members = velair_api.room_group_members(live, name)
+    if members:
+        print(f"group {name}: exists members={members}")
+        return members
+    members = list((cfg.groups.get(name) or {}).get("entities") or [])
+    print(f"group {name}: no Velair room group; same blocks -> {members}")
+    return members
+
+
+def _apply_velair(
+    cfg: ScheduleConfig, client: HaClient, dry: bool, profile: Optional[str]
+) -> int:
+    """Diff and push schedules through Velair.
+
+    Args:
+        cfg: Config.
+        client: HA client.
+        dry: Skip writes.
+        profile: Optional profile name.
+    Returns:
+        Exit code.
+    """
+    live = velair_api.fetch_schedule(client)
+    mode = (live.get("global") or {}).get("mode")
+    print(f"velair scheduler: {mode} revision={live.get('configuration_revision')}")
+    if mode == "paused":
+        print("NOTE: scheduler is paused; saved blocks do not run until resumed")
+    zones = live.get("zones") or {}
+    revision: Optional[int] = None
+
+    for key in schedule_keys(cfg, profile):
+        targets = _velair_targets(cfg, key, live)
+        missing = [ent for ent in targets if ent not in zones]
+        if missing:
+            print(f"{key}: not managed by Velair: {missing}")
+            return 1
+        desired = _desired_schedule_map(cfg, key, profile)
+        saved = [velair_api.zone_schedule(live, ent) for ent in targets]
+        print(f"## {key}")
+        if not dry:
+            step = _temp_step(cfg, key, desired)
+            if step is not None:
+                for ent in targets:
+                    print(f"{ent}: target_temp_step={step}")
+                    velair_api.set_temp_step(client, ent, float(step))
+        for label, nodes in desired.items():
+            days = velair_api.days_for_label(label)
+            blocks = velair_api.nodes_to_blocks(nodes)
+            shared = velair_api.shared_nodes(saved, days)
+            if shared is None:
+                for ent, sched in zip(targets, saved):
+                    for day in days:
+                        diffs = _diff_nodes(nodes, velair_api.blocks_to_nodes(sched.get(day) or []))
+                        print(f"{ent} {day}:")
+                        print("\n".join(diffs) if diffs else "  unchanged")
+            else:
+                diffs = _diff_nodes(nodes, shared)
+                shown = ",".join(days) if label not in ("weekday", "weekend", "all_days") else label
+                if diffs:
+                    print(f"{shown}:")
+                    print("\n".join(diffs))
+                else:
+                    print(f"{shown}: unchanged")
+            if dry:
+                continue
+            for ent in targets:
+                for day in days:
+                    result = velair_api.set_day(client, ent, day, blocks, revision)
+                    revision = _revision_from(result) or revision
+
+    _apply_automations(cfg, client, dry)
+    for sw in cfg.legacy_disable:
+        st = client.get_state(sw)
+        cur = (st or {}).get("state")
+        if cur == "on":
+            print(f"legacy {sw}: on -> off")
+            if not dry:
+                client.call_service("switch", "turn_off", {"entity_id": sw})
+        else:
+            print(f"legacy {sw}: {cur or 'missing'}")
+    print("0 writes" if dry else f"writes={client.writes}")
+    return 0
+
+
 def cmd_apply(args: argparse.Namespace) -> int:
     """Apply schedule to Climate Scheduler.
 
@@ -360,9 +588,12 @@ def cmd_apply(args: argparse.Namespace) -> int:
         path = backups / f"{stamp}.yaml"
         # temporary allow reads only already; backup uses write=False
         path.write_text(yaml.safe_dump(snap, sort_keys=False))
-        cfg.raw.setdefault("backup", {})["last"] = str(path.relative_to(ROOT))
-        save_config(cfg)
+        rel = str(path.relative_to(ROOT))
+        _note_backup(cfg, rel)
         print(f"backup: {path}")
+
+    if _uses_velair(client):
+        return _apply_velair(cfg, client, dry, args.profile)
 
     try:
         existing_groups = cs_api.list_groups(client)
@@ -422,9 +653,12 @@ def cmd_apply(args: argparse.Namespace) -> int:
     for sw in cfg.legacy_disable:
         st = client.get_state(sw)
         cur = (st or {}).get("state")
-        print(f"legacy {sw}: {cur} -> off")
-        if not dry and cur != "off":
-            client.call_service("switch", "turn_off", {"entity_id": sw})
+        if cur == "on":
+            print(f"legacy {sw}: on -> off")
+            if not dry:
+                client.call_service("switch", "turn_off", {"entity_id": sw})
+        else:
+            print(f"legacy {sw}: {cur or 'missing'}")
 
     if not dry:
         cs_api.sync_all(client)
@@ -451,15 +685,15 @@ def _apply_automations(cfg: ScheduleConfig, client: HaClient, dry: bool) -> None
         conf = {
             "alias": alias,
             "mode": "single",
-            "trigger": [
-                {"platform": "state", "entity_id": entity},
+            "triggers": [
+                {"trigger": "state", "entity_id": entity},
                 {
-                    "platform": "numeric_state",
+                    "trigger": "numeric_state",
                     "entity_id": sensor,
                     "below": min_c,
                 },
             ],
-            "condition": [
+            "conditions": [
                 {
                     "condition": "numeric_state",
                     "entity_id": sensor,
@@ -472,7 +706,7 @@ def _apply_automations(cfg: ScheduleConfig, client: HaClient, dry: bool) -> None
                     ],
                 },
             ],
-            "action": [
+            "actions": [
                 {
                     "action": "climate.set_hvac_mode",
                     "target": {"entity_id": entity},
@@ -481,7 +715,7 @@ def _apply_automations(cfg: ScheduleConfig, client: HaClient, dry: bool) -> None
             ],
         }
         if fallback:
-            conf["action"].append(
+            conf["actions"].append(
                 {
                     "action": "script.turn_on",
                     "target": {"entity_id": fallback},
@@ -491,20 +725,18 @@ def _apply_automations(cfg: ScheduleConfig, client: HaClient, dry: bool) -> None
         print(f"automation pool_gate id={aid}")
         if not dry:
             if not aid:
-                # create with a generated id
                 aid = f"pool_gate_{int(datetime.now().timestamp())}"
                 conf["id"] = aid
                 client.set_automation_config(str(aid), conf)
-                cfg.raw["automations"]["pool_gate"]["id"] = aid
-                save_config(cfg)
-                print(f"created pool_gate id={aid}")
+                print(f"created pool_gate id={aid}; set automations.pool_gate.id")
             else:
-                # merge onto existing if present
                 try:
                     existing = client.get_automation_config(str(aid))
                 except Exception:
                     existing = {}
                 merged = existing if isinstance(existing, dict) else {}
+                for old in ("trigger", "condition", "action"):
+                    merged.pop(old, None)
                 merged.update(conf)
                 client.set_automation_config(str(aid), merged)
 
@@ -512,55 +744,29 @@ def _apply_automations(cfg: ScheduleConfig, client: HaClient, dry: bool) -> None
     aid = tuv.get("id")
     if aid:
         print(f"automation tuv_charge id={aid}")
-        triggers = []
+        clocks: Dict[str, List[str]] = {}
         for trig in tuv.get("triggers") or []:
             days = list(trig.get("weekday") or [])
-            resolved = resolve_automation_trigger(cfg, str(trig["at"]), days)
-            # collapse to unique clocks with weekday list
-            clocks: Dict[str, List[str]] = {}
-            for day, clock in resolved:
-                clocks.setdefault(clock, []).append(day)
-            for clock, wdays in clocks.items():
-                triggers.append(
-                    {
-                        "platform": "time",
-                        "at": clock,
-                        # HA time trigger has no weekday; keep as separate automations
-                        # via condition
-                    }
-                )
-        # Prefer editing only time triggers while preserving conditions/actions
+            for day, clock in resolve_automation_trigger(cfg, str(trig["at"]), days):
+                clocks.setdefault(clock, [])
+                if day not in clocks[clock]:
+                    clocks[clock].append(day)
+        new_triggers = [
+            {
+                "trigger": "time",
+                "at": clock if clock.count(":") == 2 else f"{clock}:00",
+                "weekday": days,
+            }
+            for clock, days in clocks.items()
+        ]
+        print(f"tuv_charge triggers -> {new_triggers}")
         if not dry:
             existing = client.get_automation_config(str(aid))
             if not isinstance(existing, dict):
                 raise RuntimeError("tuv_charge config missing")
-            # Build time triggers with weekday conditions using template/time + condition
-            new_triggers = []
-            new_conditions_note = []
-            for trig in tuv.get("triggers") or []:
-                days = list(trig.get("weekday") or [])
-                for day, clock in resolve_automation_trigger(cfg, str(trig["at"]), days[:1]):
-                    # one trigger per unique (clock) - use first day resolution (same clock)
-                    pass
-            # Simpler: unique absolute clocks from triggers
-            seen_clock = []
-            for trig in tuv.get("triggers") or []:
-                days = list(trig.get("weekday") or DAYS)
-                # resolve per first matching day of each kind
-                for day in days:
-                    _, clock = resolve_automation_trigger(cfg, str(trig["at"]), [day])[0]
-                    if clock not in seen_clock:
-                        seen_clock.append(clock)
-                        new_triggers.append({"platform": "time", "at": clock})
-                    break
-            existing["trigger"] = new_triggers
-            print(f"tuv_charge triggers -> {new_triggers}")
+            existing.pop("trigger", None)
+            existing["triggers"] = new_triggers
             client.set_automation_config(str(aid), existing)
-        else:
-            for trig in tuv.get("triggers") or []:
-                days = list(trig.get("weekday") or [])
-                for day, clock in resolve_automation_trigger(cfg, str(trig["at"]), days):
-                    print(f"  would set trigger {day} at {clock} (exact)")
 
 
 def cmd_collect(args: argparse.Namespace) -> int:

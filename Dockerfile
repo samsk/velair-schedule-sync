@@ -5,6 +5,5 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY . .
-
+# Source is bind-mounted at /app by compose
 ENTRYPOINT ["python", "sync.py"]

@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
+import socket
 import ssl
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 
 @dataclass
@@ -154,7 +157,7 @@ class HaClient:
         Returns:
             Config dict.
         """
-        return self.get("/api/")
+        return self.get("/api/config")
 
     def get_automation_config(self, automation_id: str) -> Any:
         """Fetch automation config by id.
@@ -249,6 +252,125 @@ class HaClient:
             Result map.
         """
         return asyncio.run(self.ws_statistics(statistic_ids, start, end, period))
+
+    def ws_command(self, msg_type: str, fields: Optional[Dict[str, Any]] = None, *, write: bool = False) -> Any:
+        """Send one HA websocket command.
+
+        Args:
+            msg_type: Command type, e.g. velair/get_schedule.
+            fields: Extra command fields.
+            write: Count as a mutating call.
+        Returns:
+            Result payload.
+        """
+        if write:
+            if not self.allow_writes:
+                raise RuntimeError(f"write blocked in dry-run: {msg_type}")
+            self.writes += 1
+            self._write_log.append(f"WS {msg_type}")
+        return _ws_command(self.url, self.token, msg_type, fields or {})
+
+
+def _ws_command(url: str, token: str, msg_type: str, fields: Dict[str, Any]) -> Any:
+    """Authenticated HA websocket command over stdlib sockets.
+
+    Args:
+        url: HA base URL.
+        token: Access token.
+        msg_type: Command type.
+        fields: Extra command fields.
+    Returns:
+        Result object.
+    """
+    parsed = urlparse(url)
+    host = parsed.hostname or ""
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    path = (parsed.path.rstrip("/") or "") + "/api/websocket"
+    key = base64.b64encode(os.urandom(16)).decode()
+    request = (
+        f"GET {path} HTTP/1.1\r\n"
+        f"Host: {host}\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        f"Sec-WebSocket-Key: {key}\r\n"
+        "Sec-WebSocket-Version: 13\r\n\r\n"
+    )
+    raw = socket.create_connection((host, port), timeout=20)
+    sock: socket.socket = raw
+    if parsed.scheme == "https":
+        sock = ssl.create_default_context().wrap_socket(raw, server_hostname=host)
+    try:
+        sock.sendall(request.encode())
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = sock.recv(4096)
+            if not chunk:
+                raise RuntimeError("websocket handshake closed")
+            buf += chunk
+        status = buf.split(b"\r\n", 1)[0].decode(errors="replace")
+        if " 101 " not in status:
+            raise RuntimeError(f"websocket handshake failed: {status}")
+
+        def recv_exact(n: int) -> bytes:
+            data = b""
+            while len(data) < n:
+                part = sock.recv(n - len(data))
+                if not part:
+                    raise RuntimeError("websocket closed")
+                data += part
+            return data
+
+        def recv_json() -> Dict[str, Any]:
+            parts: List[bytes] = []
+            while True:
+                hdr = recv_exact(2)
+                opcode = hdr[0] & 0x0F
+                fin = hdr[0] & 0x80
+                ln = hdr[1] & 0x7F
+                if ln == 126:
+                    ln = int.from_bytes(recv_exact(2), "big")
+                elif ln == 127:
+                    ln = int.from_bytes(recv_exact(8), "big")
+                data = recv_exact(ln)
+                if opcode == 8:
+                    raise RuntimeError(f"websocket closed: {data.decode(errors='replace')}")
+                if opcode == 9:
+                    continue
+                if opcode in (0, 1):
+                    parts.append(data)
+                    if fin:
+                        return json.loads(b"".join(parts).decode())
+
+        def send_text(text: str) -> None:
+            payload = text.encode()
+            mask = os.urandom(4)
+            ln = len(payload)
+            header = bytearray([0x81])
+            if ln < 126:
+                header.append(0x80 | ln)
+            elif ln < 65536:
+                header.append(0x80 | 126)
+                header.extend(ln.to_bytes(2, "big"))
+            else:
+                header.append(0x80 | 127)
+                header.extend(ln.to_bytes(8, "big"))
+            masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+            sock.sendall(bytes(header) + mask + masked)
+
+        hello = recv_json()
+        if hello.get("type") != "auth_required":
+            raise RuntimeError(f"unexpected ws hello: {hello}")
+        send_text(json.dumps({"type": "auth", "access_token": token}))
+        auth = recv_json()
+        if auth.get("type") != "auth_ok":
+            raise RuntimeError(f"ws auth failed: {auth.get('type')}")
+        send_text(json.dumps({"id": 1, "type": msg_type, **fields}))
+        reply = recv_json()
+        if not reply.get("success"):
+            raise RuntimeError(f"{msg_type} failed: {reply.get('error') or reply}")
+        return reply.get("result")
+    finally:
+        sock.close()
 
 
 def load_connection(

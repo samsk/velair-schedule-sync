@@ -1,0 +1,12 @@
+# Optional local Home Assistant for manual blackbox checks.
+# Start with: make ha-up
+services:
+  homeassistant:
+    image: ghcr.io/home-assistant/home-assistant:stable
+    profiles: [ha]
+    ports:
+      - "127.0.0.1:8123:8123"
+    volumes:
+      - ./tests/ha/config:/config
+    environment:
+      TZ: Europe/Bratislava

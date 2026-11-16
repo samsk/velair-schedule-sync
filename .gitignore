@@ -8,3 +8,8 @@ __pycache__/
 
 payloads/
 schedule*.yaml
+docs/plan/
+
+tests/ha.env
+tests/ha/config/**
+!tests/ha/config/.gitkeep
