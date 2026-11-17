@@ -1,7 +1,6 @@
 version: 1
 context:
   summary: blackbox fixture
-  collect_sensors: []
 specifiers:
   LT_workday:
     days: [mon, tue, wed, thu, fri]
@@ -80,8 +79,25 @@ schedules:
     weekend: *pool_days
 groups: {}
 profiles: {}
+scheduler:
+  status_sensor: sensor.heating_scheduler_scheduler_status
+  paused_state: paused
+collect:
+  period: hour
+  metrics:
+    consumed_kwh:
+      stat: recording:rconsumedenergyexternal
+      agg: state_sum
+    produced_kwh:
+      stat: recording:routputproducedexternal
+      agg: state_sum
+  ratios:
+    cop:
+      num: produced_kwh
+      den: consumed_kwh
 automations:
   pool_gate:
+    type: outdoor_gate
     id: pool_gate_velair
     alias: Pool heat only if outdoor at least 5 C
     entity: climate.pool
@@ -89,6 +105,7 @@ automations:
     min_outdoor_c: 5
     fallback_script: script.pool_heating_off
   tuv_charge:
+    type: time_switch
     id: '1760162526412'
     alias: TUV Charge Low Tarif
     entity: switch.charge

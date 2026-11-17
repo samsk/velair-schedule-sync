@@ -13,14 +13,15 @@ from typing import Any, Dict, List, Optional
 import yaml
 
 from lib import cs_api, velair_api
+from lib.collect import check_collect, compute_results, stat_ids
 from lib.config import ScheduleConfig, climate_entities, load_config, save_config
 from lib.ha import HaClient, load_connection
 from lib.lint import exit_code, validate
 from lib.resolve import (
     format_nodes,
     nodes_to_cs_payload,
-    resolve_automation_trigger,
     resolve_day_nodes,
+    resolve_time_triggers,
     schedule_keys,
 )
 from lib.timeutil import DAYS, expand_days
@@ -125,13 +126,16 @@ def cmd_test(args: argparse.Namespace) -> int:
             return 1
         step = (state.get("attributes") or {}).get("target_temp_step")
         print(f"entity {ent}: ok target_temp_step={step}")
-    status = client.get_state("sensor.heating_scheduler_scheduler_status")
-    if status:
-        print(f"scheduler status: {status.get('state')}")
-        if status.get("state") == "paused":
-            print("NOTE: unpause Climate Scheduler in the Velair card before apply --yes")
-    else:
-        print("scheduler status sensor: missing")
+    status_sensor = (cfg.scheduler or {}).get("status_sensor")
+    if status_sensor:
+        paused = (cfg.scheduler or {}).get("paused_state", "paused")
+        status = client.get_state(str(status_sensor))
+        if status:
+            print(f"scheduler status: {status.get('state')}")
+            if status.get("state") == paused:
+                print("NOTE: scheduler paused; unpause before apply --yes")
+        else:
+            print(f"scheduler status sensor missing: {status_sensor}")
     print("test ok (0 writes)")
     return 0
 
@@ -667,34 +671,6 @@ def cmd_apply(args: argparse.Namespace) -> int:
     return 0
 
 
-def _resolve_tuv_triggers(
-    cfg: ScheduleConfig, tuv: Dict[str, Any]
-) -> List[Dict[str, Any]]:
-    """Resolve tuv_charge time triggers from specifier tokens.
-
-    Args:
-        cfg: Config.
-        tuv: tuv_charge automation block.
-    Returns:
-        HA time trigger list.
-    """
-    clocks: Dict[str, List[str]] = {}
-    for trig in tuv.get("triggers") or []:
-        days = list(trig.get("weekday") or [])
-        for day, clock in resolve_automation_trigger(cfg, str(trig["at"]), days):
-            clocks.setdefault(clock, [])
-            if day not in clocks[clock]:
-                clocks[clock].append(day)
-    return [
-        {
-            "trigger": "time",
-            "at": clock if clock.count(":") == 2 else f"{clock}:00",
-            "weekday": days,
-        }
-        for clock, days in clocks.items()
-    ]
-
-
 def _yaml_label_specs(auto: Dict[str, Any]) -> List[Any]:
     """Read optional labels list from an automation block.
 
@@ -796,133 +772,173 @@ def _apply_automation_labels(
     client.set_entity_labels(entity_id, resolved)
 
 
+def _apply_outdoor_gate(
+    name: str, auto: Dict[str, Any], client: HaClient, dry: bool
+) -> None:
+    """Upsert an outdoor_gate automation.
+
+    Args:
+        name: Automation key in yaml.
+        auto: Automation block.
+        client: HA client.
+        dry: Dry-run flag.
+    """
+    entity = auto["entity"]
+    sensor = auto["outdoor_sensor"]
+    min_c = auto["min_outdoor_c"]
+    alias = auto.get("alias") or name
+    fallback = auto.get("fallback_script")
+    conf = {
+        "alias": alias,
+        "mode": "single",
+        "triggers": [
+            {"trigger": "state", "entity_id": entity},
+            {
+                "trigger": "numeric_state",
+                "entity_id": sensor,
+                "below": min_c,
+            },
+        ],
+        "conditions": [
+            {
+                "condition": "numeric_state",
+                "entity_id": sensor,
+                "below": min_c,
+            },
+            {
+                "condition": "not",
+                "conditions": [
+                    {"condition": "state", "entity_id": entity, "state": "off"}
+                ],
+            },
+        ],
+        "actions": [
+            {
+                "action": "climate.set_hvac_mode",
+                "target": {"entity_id": entity},
+                "data": {"hvac_mode": "off"},
+            }
+        ],
+    }
+    if fallback:
+        conf["actions"].append(
+            {
+                "action": "script.turn_on",
+                "target": {"entity_id": fallback},
+            }
+        )
+    aid = auto.get("id")
+    print(f"automation {name} id={aid}")
+    if not dry:
+        if not aid:
+            aid = f"{name}_{int(datetime.now().timestamp())}"
+            conf["id"] = aid
+            client.set_automation_config(str(aid), conf)
+            print(f"created {name} id={aid}; set automations.{name}.id")
+        else:
+            try:
+                existing = client.get_automation_config(str(aid))
+            except Exception:
+                existing = {}
+            merged = existing if isinstance(existing, dict) else {}
+            for old in ("trigger", "condition", "action"):
+                merged.pop(old, None)
+            merged.update(conf)
+            client.set_automation_config(str(aid), merged)
+        _apply_automation_labels(client, str(aid), auto, dry=False)
+    else:
+        _apply_automation_labels(client, str(aid or name), auto, dry=True)
+
+
+def _apply_time_switch(
+    cfg: ScheduleConfig,
+    name: str,
+    auto: Dict[str, Any],
+    client: HaClient,
+    dry: bool,
+) -> None:
+    """Upsert a time_switch automation.
+
+    Args:
+        cfg: Config.
+        name: Automation key in yaml.
+        auto: Automation block.
+        client: HA client.
+        dry: Dry-run flag.
+    """
+    aid = auto.get("id")
+    if not aid:
+        print(f"automation {name}: missing id; skip")
+        return
+    print(f"automation {name} id={aid}")
+    new_triggers = resolve_time_triggers(cfg, auto)
+    print(f"{name} triggers -> {new_triggers}")
+    entity = auto.get("entity")
+    temp_sensor = auto.get("temp_sensor")
+    below_c = auto.get("below_c")
+    alias = auto.get("alias") or name
+    full = entity and temp_sensor is not None and below_c is not None
+    if full:
+        domain = str(entity).split(".", 1)[0]
+        conditions = [
+            {
+                "condition": "numeric_state",
+                "entity_id": temp_sensor,
+                "below": below_c,
+            }
+        ]
+        actions = [
+            {
+                "action": f"{domain}.turn_on",
+                "target": {"entity_id": entity},
+            }
+        ]
+        print(f"{name} condition -> {conditions}")
+        print(f"{name} action -> {actions}")
+    else:
+        conditions = None
+        actions = None
+    if not dry:
+        try:
+            existing = client.get_automation_config(str(aid))
+        except Exception:
+            existing = None
+        if not isinstance(existing, dict):
+            existing = {"id": str(aid), "mode": "single"}
+            print(f"created {name} id={aid}")
+        for old in ("trigger", "condition", "action"):
+            existing.pop(old, None)
+        existing["alias"] = alias
+        existing["mode"] = existing.get("mode") or "single"
+        existing["triggers"] = new_triggers
+        if conditions is not None:
+            existing["conditions"] = conditions
+        if actions is not None:
+            existing["actions"] = actions
+        client.set_automation_config(str(aid), existing)
+        _apply_automation_labels(client, str(aid), auto, dry=False)
+    else:
+        _apply_automation_labels(client, str(aid), auto, dry=True)
+
+
 def _apply_automations(cfg: ScheduleConfig, client: HaClient, dry: bool) -> None:
-    """Upsert pool_gate and tuv_charge automations plus labels.
+    """Upsert typed automations plus labels.
 
     Args:
         cfg: Config.
         client: HA client.
         dry: Dry-run flag.
     """
-    pool = cfg.automations.get("pool_gate") or {}
-    if pool:
-        entity = pool.get("entity", "climate.pool")
-        sensor = pool.get("outdoor_sensor", "sensor.outdoor_temperature")
-        min_c = pool.get("min_outdoor_c", 5)
-        alias = pool.get("alias", "Pool outdoor gate")
-        fallback = pool.get("fallback_script")
-        conf = {
-            "alias": alias,
-            "mode": "single",
-            "triggers": [
-                {"trigger": "state", "entity_id": entity},
-                {
-                    "trigger": "numeric_state",
-                    "entity_id": sensor,
-                    "below": min_c,
-                },
-            ],
-            "conditions": [
-                {
-                    "condition": "numeric_state",
-                    "entity_id": sensor,
-                    "below": min_c,
-                },
-                {
-                    "condition": "not",
-                    "conditions": [
-                        {"condition": "state", "entity_id": entity, "state": "off"}
-                    ],
-                },
-            ],
-            "actions": [
-                {
-                    "action": "climate.set_hvac_mode",
-                    "target": {"entity_id": entity},
-                    "data": {"hvac_mode": "off"},
-                }
-            ],
-        }
-        if fallback:
-            conf["actions"].append(
-                {
-                    "action": "script.turn_on",
-                    "target": {"entity_id": fallback},
-                }
-            )
-        aid = pool.get("id")
-        print(f"automation pool_gate id={aid}")
-        if not dry:
-            if not aid:
-                aid = f"pool_gate_{int(datetime.now().timestamp())}"
-                conf["id"] = aid
-                client.set_automation_config(str(aid), conf)
-                print(f"created pool_gate id={aid}; set automations.pool_gate.id")
-            else:
-                try:
-                    existing = client.get_automation_config(str(aid))
-                except Exception:
-                    existing = {}
-                merged = existing if isinstance(existing, dict) else {}
-                for old in ("trigger", "condition", "action"):
-                    merged.pop(old, None)
-                merged.update(conf)
-                client.set_automation_config(str(aid), merged)
-            _apply_automation_labels(client, str(aid), pool, dry=False)
+    for name, auto in (cfg.automations or {}).items():
+        if not isinstance(auto, dict):
+            continue
+        atype = auto.get("type")
+        if atype == "outdoor_gate":
+            _apply_outdoor_gate(name, auto, client, dry)
+        elif atype == "time_switch":
+            _apply_time_switch(cfg, name, auto, client, dry)
         else:
-            _apply_automation_labels(client, str(aid or "pool_gate"), pool, dry=True)
-
-    tuv = cfg.automations.get("tuv_charge") or {}
-    aid = tuv.get("id")
-    if aid:
-        print(f"automation tuv_charge id={aid}")
-        new_triggers = _resolve_tuv_triggers(cfg, tuv)
-        print(f"tuv_charge triggers -> {new_triggers}")
-        entity = tuv.get("entity")
-        temp_sensor = tuv.get("temp_sensor")
-        below_c = tuv.get("below_c")
-        alias = tuv.get("alias", "TUV Charge Low Tarif")
-        full = entity and temp_sensor is not None and below_c is not None
-        if full:
-            conditions = [
-                {
-                    "condition": "numeric_state",
-                    "entity_id": temp_sensor,
-                    "below": below_c,
-                }
-            ]
-            actions = [
-                {
-                    "action": "switch.turn_on",
-                    "target": {"entity_id": entity},
-                }
-            ]
-            print(f"tuv_charge condition -> {conditions}")
-            print(f"tuv_charge action -> {actions}")
-        else:
-            conditions = None
-            actions = None
-        if not dry:
-            try:
-                existing = client.get_automation_config(str(aid))
-            except Exception:
-                existing = None
-            if not isinstance(existing, dict):
-                existing = {"id": str(aid), "mode": "single"}
-                print(f"created tuv_charge id={aid}")
-            for old in ("trigger", "condition", "action"):
-                existing.pop(old, None)
-            existing["alias"] = alias
-            existing["mode"] = existing.get("mode") or "single"
-            existing["triggers"] = new_triggers
-            if conditions is not None:
-                existing["conditions"] = conditions
-            if actions is not None:
-                existing["actions"] = actions
-            client.set_automation_config(str(aid), existing)
-            _apply_automation_labels(client, str(aid), tuv, dry=False)
-        else:
-            _apply_automation_labels(client, str(aid), tuv, dry=True)
+            raise RuntimeError(f"automations.{name}: unknown type {atype!r}")
 
 
 def cmd_collect(args: argparse.Namespace) -> int:
@@ -934,52 +950,29 @@ def cmd_collect(args: argparse.Namespace) -> int:
         Exit code.
     """
     cfg = _cfg(args.config)
+    collect = cfg.collect or {}
+    errors = check_collect(collect)
+    if errors:
+        for err in errors:
+            print(f"collect schema: {err}")
+        return 1
+    statistic_ids = stat_ids(collect)
+    if not statistic_ids:
+        print("no collect.metrics defined; nothing to collect")
+        return 1
     client = load_connection(args.url, args.token, ROOT)
     client.allow_writes = False
     since = args.since
     end = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S+00:00")
     start = f"{since}T00:00:00+00:00"
-    statistic_ids = list(cfg.context.get("collect_sensors") or [])
-    if not statistic_ids:
-        print("no context.collect_sensors defined; nothing to collect")
-        return 1
+    period = str(collect.get("period") or "hour")
     try:
-        stats = client.statistics(statistic_ids, start, end, period="hour")
+        stats = client.statistics(statistic_ids, start, end, period=period)
     except Exception as exc:
         print(f"statistics error: {exc}")
         stats = {}
 
-    eheater = stats.get("recording:reheaterexternal") or []
-    eheater_kwh = 0.0
-    for row in eheater:
-        ch = row.get("change")
-        if ch is not None:
-            eheater_kwh += float(ch)
-
-    low = stats.get("sensor.strecno_h1_low_tariff_meter_reading") or []
-    high = stats.get("sensor.strecno_h1_high_tariff_meter_reading") or []
-
-    def _delta(rows: List[Dict[str, Any]]) -> Optional[float]:
-        vals = [r.get("state") for r in rows if r.get("state") is not None]
-        if len(vals) < 2:
-            changes = [r.get("change") for r in rows if r.get("change") is not None]
-            if changes:
-                return float(sum(changes))
-            return None
-        return float(vals[-1]) - float(vals[0])
-
-    low_d = _delta(low)
-    high_d = _delta(high)
-    lt_share = None
-    if low_d is not None and high_d is not None and (low_d + high_d) != 0:
-        lt_share = round(low_d / (low_d + high_d), 3)
-
-    results = {
-        "eheater_lt_kwh": round(eheater_kwh, 3),
-        "lt_share": lt_share,
-        "low_tariff_delta": low_d,
-        "high_tariff_delta": high_d,
-    }
+    results = compute_results(collect, stats)
     entry = {
         "date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
         "period": f"{since}/{datetime.now(timezone.utc).strftime('%Y-%m-%d')}",
@@ -987,11 +980,14 @@ def cmd_collect(args: argparse.Namespace) -> int:
         "verdict": None,
         "changes": None,
     }
+    print(yaml.safe_dump(entry, sort_keys=False))
+    if args.dry_run:
+        print("dry-run: reviews not written")
+        return 0
     reviews = list(cfg.raw.get("reviews") or [])
     reviews.append(entry)
     cfg.raw["reviews"] = reviews
     save_config(cfg)
-    print(yaml.safe_dump(entry, sort_keys=False))
     print(f"appended reviews entry ({len(reviews)} total)")
     return 0
 
@@ -1041,6 +1037,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     c = sub.add_parser("collect", help="Collect stats into reviews")
     c.add_argument("--since", required=True)
+    c.add_argument("--dry-run", action="store_true")
     c.set_defaults(func=cmd_collect)
 
     return p

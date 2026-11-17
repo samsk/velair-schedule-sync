@@ -1,8 +1,10 @@
 # Velair heating sync via docker compose
-# Root has no compose plugin; use the standalone binary.
 # Bind-mount this tree so the container always runs local source.
+# sudo make runs as root, which has no compose plugin, so `docker compose`
+# is parsed by docker itself and -f fails. Fall back to the standalone v2 binary.
 ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
-COMPOSE := /usr/local/bin/docker-compose -f $(ROOT)/compose.yaml --project-directory $(ROOT)
+COMPOSE_BIN := $(shell docker compose version >/dev/null 2>&1 && echo docker compose || echo /usr/local/bin/docker-compose)
+COMPOSE := $(COMPOSE_BIN) -f $(ROOT)/compose.yaml --project-directory $(ROOT)
 COMPOSE_HA := $(COMPOSE) -f $(ROOT)/compose.ha.yaml --profile ha
 RUN := $(COMPOSE) run --rm --volume $(ROOT):/app velair
 PYTEST := $(COMPOSE) run --rm --volume $(ROOT):/app --entrypoint python velair -m pytest

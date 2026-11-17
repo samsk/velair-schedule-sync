@@ -521,3 +521,31 @@ def resolve_automation_trigger(
         minutes, _ = resolve_token(cfg, at_token, day, for_schedule=False)
         out.append((day, format_clock(minutes)))
     return out
+
+
+def resolve_time_triggers(
+    cfg: ScheduleConfig, auto: Dict[str, Any]
+) -> List[Dict[str, Any]]:
+    """Resolve time_switch triggers from specifier tokens.
+
+    Args:
+        cfg: Config.
+        auto: Automation block with triggers list.
+    Returns:
+        HA time trigger list.
+    """
+    clocks: Dict[str, List[str]] = {}
+    for trig in auto.get("triggers") or []:
+        days = list(trig.get("weekday") or [])
+        for day, clock in resolve_automation_trigger(cfg, str(trig["at"]), days):
+            clocks.setdefault(clock, [])
+            if day not in clocks[clock]:
+                clocks[clock].append(day)
+    return [
+        {
+            "trigger": "time",
+            "at": clock if clock.count(":") == 2 else f"{clock}:00",
+            "weekday": days,
+        }
+        for clock, days in clocks.items()
+    ]

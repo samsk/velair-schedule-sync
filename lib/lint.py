@@ -27,6 +27,12 @@ BUILTIN_IDS = {
     "cycle_closed",
     "noop_nodes",
     "time_grid",
+    "config_schema",
+}
+
+AUTO_TYPES = {
+    "outdoor_gate": ("entity", "outdoor_sensor", "min_outdoor_c"),
+    "time_switch": ("id", "triggers"),
 }
 
 USER_TYPES = {
@@ -825,7 +831,31 @@ def lint_no_overlap_above(cfg: ScheduleConfig, rule: Dict[str, Any]) -> List[Fin
         # automation windows
         for auto in rule.get("automations") or []:
             name = auto.get("name")
-            dur = int(auto.get("duration_minutes") or 45)
+            if name not in (cfg.automations or {}):
+                out.append(
+                    Finding(
+                        "user",
+                        rid,
+                        "error",
+                        f"automation:{name}",
+                        day,
+                        f"unknown automations.{name}",
+                    )
+                )
+                continue
+            if auto.get("duration_minutes") is None:
+                out.append(
+                    Finding(
+                        "user",
+                        rid,
+                        "error",
+                        f"automation:{name}",
+                        day,
+                        "missing duration_minutes",
+                    )
+                )
+                continue
+            dur = int(auto["duration_minutes"])
             auto_cfg = cfg.automations.get(name) or {}
             for trig in auto_cfg.get("triggers") or []:
                 days = list(trig.get("weekday") or DAYS)
@@ -892,6 +922,60 @@ def lint_forbid_node_keys(cfg: ScheduleConfig, rule: Dict[str, Any]) -> List[Fin
     return out
 
 
+def lint_config_schema(cfg: ScheduleConfig) -> List[Finding]:
+    """Validate collect and automation schema.
+
+    Args:
+        cfg: Config.
+    Returns:
+        Findings.
+    """
+    from .collect import check_collect
+
+    out: List[Finding] = []
+    for msg in check_collect(cfg.collect or {}):
+        out.append(Finding("builtin", "config_schema", "error", "collect", "-", msg))
+    for name, auto in (cfg.automations or {}).items():
+        if not isinstance(auto, dict):
+            out.append(
+                Finding(
+                    "builtin",
+                    "config_schema",
+                    "error",
+                    f"automations.{name}",
+                    "-",
+                    "must be a mapping",
+                )
+            )
+            continue
+        atype = auto.get("type")
+        if atype not in AUTO_TYPES:
+            out.append(
+                Finding(
+                    "builtin",
+                    "config_schema",
+                    "error",
+                    f"automations.{name}",
+                    "-",
+                    f"missing or unknown type {atype!r}",
+                )
+            )
+            continue
+        for key in AUTO_TYPES[atype]:
+            if auto.get(key) is None:
+                out.append(
+                    Finding(
+                        "builtin",
+                        "config_schema",
+                        "error",
+                        f"automations.{name}",
+                        "-",
+                        f"missing required key {key}",
+                    )
+                )
+    return out
+
+
 BUILTIN_LINTERS: Dict[str, Callable[..., List[Finding]]] = {
     "grid_15min": lint_grid_15min,
     "unique_times": lint_unique_times,
@@ -915,6 +999,8 @@ def validate(cfg: ScheduleConfig, *, strict: bool = False, profile: Optional[str
     """
     disabled = _disabled(cfg)
     findings: List[Finding] = []
+    if "config_schema" not in disabled:
+        findings.extend(lint_config_schema(cfg))
     keys = schedule_keys(cfg, profile)
 
     for key in keys:

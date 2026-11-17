@@ -1,24 +1,103 @@
 # Velair heating schedule agent
 
 Generic guide for creating and tuning heating schedules with this tool.
-All house-specific facts (entity roles, design notes, tariff, sensors,
-expectations) live in `schedule.yaml` under `context`. Read that file
-fully before changing anything. The yaml is the source of truth, not the
-Home Assistant UI.
+The goal: run several heating circuits on a heat pump so that heat goes
+in during the low-tariff window, or in hours when the outdoor temperature
+(and so COP) is higher, and the house then holds it through the day.
+
+## Golden rules
+
+- `schedule.yaml` is the source of truth, not the Home Assistant UI. Read
+  it fully before changing anything, including `context`, `reviews` and
+  `data_used`.
+- All house facts (entity ids, sensors, tariff, targets) live in yaml.
+  The script stays generic: never hardcode entity or statistic ids,
+  aliases or house numbers in code. Add sensors under `collect`, add
+  constraints under `rules`.
+- Make small corrections, one idea per phase. Raise or move a few nodes,
+  not the whole day. Defer the next idea to the next phase and say so in
+  `context.expectations` or `reviews`.
+- Never run `apply-yes` (or `restore --yes`) unless the user asks for it
+  in this turn. A dry-run `apply` is always safe.
+- Talking to Home Assistant is read-only except through `apply` and
+  `restore`. Do not change entities or automations in the HA UI or
+  through the API by hand.
+- Never commit `.env`, `backups/` or `schedule.yaml`. Never auto-commit.
+
+## Tuning workflow
+
+1. **Read** `schedule.yaml`: `context.summary`, `entity_roles`,
+   `design_notes`, `expectations`, the last few `reviews`.
+2. **Measure.** Run `make collect ARGS='--since <date> --dry-run'` first;
+   drop `--dry-run` to append a review. Compare against `expectations`.
+3. **Diagnose** before editing. Check the hour-by-hour story, not just
+   daily totals: setpoints, supply and tank temps, pump modulation, heat
+   pump mode, outdoor temp. Recorder statistics and history are fine for
+   this, read-only.
+4. **Note confounders** in `data_used.findings`: a house preheated before
+   a deploy, a cold snap, a DHW cycle, a missed day. One day of data is a
+   hint, not a verdict.
+5. **Change** yaml with the edit style below. Then run
+   `make validate ARGS='--strict'` and `make show` for each touched
+   entity and day, and check the resolved clocks are what you meant.
+6. **Dry-run** `make apply`. The diff must touch only what you intended.
+   Unchanged circuits and automations must stay unchanged.
+7. **Record.** Append a `reviews` entry: `period`, `results`, `verdict`,
+   `changes`. Add `data_used` findings with the period and entities.
+   Bump `context.updated`.
+8. **Apply** only when asked, then tell the user the backup path.
+
+## Tuning heuristics (heat pump houses)
+
+- Low-temp circuits (floors) are cheap to run and store heat in the
+  building mass. Lead with them in the cheap window.
+- High-temp requests (radiators, buffer tank, DHW) cost COP. Keep them
+  apart in time (`no_overlap_above`) and keep steps small
+  (`max_step_up`), or a backup electric heater may kick in.
+- A small buffer tank holds little heat. If circuits pump from it while
+  the compressor idles, it drains before the window ends. Preheat the
+  circuits first, then charge the buffer last.
+- End the preheat at the comfort target (or a little above), so rooms
+  hold heat after the window. Annotate targets in
+  `context.expectations`.
+- A midday top-up in high tariff pays off only when the COP gain beats
+  the price ratio (`tariff.lt_vs_ht`). Check it with `collect` data, per
+  outdoor temperature.
+- Judge results by energy per heating degree hour (kWh/HDH), COP and
+  backup-heater kWh, not by raw kWh. Weather changes raw kWh.
 
 ## Config layout (`schedule.yaml`)
 
+Start a new house from `schedule.example.yaml`.
+
 - `context` — human notes for the next run: `summary`, `tariff`,
-  `house`, `entity_roles`, `design_notes`, `collect_sensors`, `data_used`,
-  `expectations`. Prose; not enforced by the script.
+  `house`, `entity_roles`, `design_notes`, `data_used`, `expectations`.
+  Prose; not enforced by the script.
 - `specifiers` — named time windows (`start`, `end`, `days`). A string
   value is an alias. Low-tariff windows start with `LT_`.
 - `rules` — machine-checked constraints in two layers: `disable` (turn off
   a built-in by id) and `user` (house constraints). See Linters.
 - `schedules` — key is a climate entity id or `group:<Name>`, value
   `{mode, temp_step, weekday: [...], weekend: [...]}` (or `all_days`).
+- `collect` — metrics and ratios for `collect`. Each metric names a
+  `stat` id and `agg`:
+  - `state_sum` — sum of hourly `state` (counters that report per hour)
+  - `change_sum` — sum of hourly `change`
+  - `delta` — last minus first `state` (cumulative meters)
+  - `mean` — average of hourly `mean` (measurements)
+  - `state_mean` — average of hourly `state`
+  Ratios use `num` / `den`; `den` may be a list to sum. A missing or zero
+  `den` gives `null`. Check which agg fits a sensor by looking at its raw
+  statistic rows before trusting a number.
+- `scheduler` — optional `{status_sensor, paused_state}` for `test`.
 - `groups`, `profiles`, `automations`, `legacy_disable`, `backup`.
-- `reviews` — append-only log written by `collect`.
+- `automations.<name>` — required `type`:
+  - `outdoor_gate`: `entity`, `outdoor_sensor`, `min_outdoor_c`
+    (optional `id`, `fallback_script`, `alias`, `labels`)
+  - `time_switch`: `id`, `triggers` (`at` specifier token + `weekday`
+    list; optional `entity` + `temp_sensor` + `below_c`, `alias`,
+    `labels`)
+- `reviews` — append-only log, written by `collect` or by the agent.
 
 ## Schedule nodes
 
@@ -35,17 +114,24 @@ Home Assistant UI.
   `max_step_up` limit, so a ramp can never break the step rule.
 - Resolver snaps temps to `temp_step`, rounds times to the 15-minute grid
   (`.end` setbacks floor, all else ceil), and sorts each day.
+- A window that crosses midnight (`22:00`-`06:00`) puts its late nodes on
+  the same calendar day's evening. Weekend days reset at `00:00`, so give
+  them an explicit `00:00` node.
 
 ## Linters (run by `validate` and before every `apply`)
 
 - Built-in: `grid_15min`, `unique_times`, `temp_bounds`,
   `temp_step_multiple`, `ramp_geometry`, `rule_threshold_sanity`,
-  `midnight_transition`, `cycle_closed`, `noop_nodes` (warn).
+  `midnight_transition`, `cycle_closed`, `noop_nodes` (warn),
+  `config_schema` (collect + automation types).
 - User rule types: `max_step_up` (`limit_c`, `min_gap_minutes`,
   `window_c`/`window_minutes`), `max_temp_outside` (`windows`, `above_c`),
   `no_overlap_above` (`above_c` scalar or per-entity map, plus
-  `automations`), `forbid_node_keys`, `min_temp_at`/`max_temp_at`.
+  `automations` with required `duration_minutes`), `forbid_node_keys`.
+  `min_temp_at` / `max_temp_at` are accepted but not checked yet.
 - Add or tighten constraints in the `rules` block, never in the script.
+- If a linter blocks a change, fix the schedule, not the rule. Relax a
+  rule only when the user agrees, and write the reason in `reason`.
 - `validate --strict` promotes warnings to errors.
 
 ## Climate Scheduler notes (v1.15)
@@ -59,21 +145,30 @@ Home Assistant UI.
 
 ## Edit style
 
-Move specifier offsets or the specifier window instead of pasting new
-clock times. Append `reviews` (verdict and what changed); never delete
-earlier `reviews` or `data_used`.
+- Move specifier offsets or the specifier window instead of pasting new
+  clock times.
+- Keep each day sorted by intent (window start to window end) so diffs
+  read well.
+- Append `reviews` (verdict and what changed); never delete earlier
+  `reviews` or `data_used`.
+- When you change resolved output that a golden test covers
+  (`tests/expected_*.txt`), update the golden file in the same change.
 
-## Loop
+## Commands
+
+All commands run in docker via `make` (`docker compose`).
 
 ```
-make validate
-make show ARGS='--entity climate.hc1 --day weekday'
-make test
-make collect ARGS='--since <date>'
-make apply            # dry-run diff
-make apply-yes        # only when asked
+make validate ARGS='--strict'
+make show ARGS='--entity climate.hc1 --day mon'
+make check                          # offline pytest + fake HA
+make test                           # HA connection, read-only
+make collect ARGS='--since <date> --dry-run'
+make collect ARGS='--since <date>'  # appends a review
+make apply                          # dry-run diff, 0 writes
+make apply-yes                      # only when asked; writes a backup
+make restore ARGS='backups/<file>.yaml'
 ```
 
 Connection comes from `.env` (`HA_URL`, `HA_TOKEN`) or `--url`/`--token`.
-Never commit `.env` or `backups/`. `collect` reads the sensor list from
-`context.collect_sensors`.
+Global flags such as `--config` go before the subcommand.

@@ -100,3 +100,35 @@ def test_dhw_overlap(schedule_raw: dict, tmp_path: Path) -> None:
     cfg = load_config(_write_tmp(tmp_path, data))
     text = "\n".join(f.format() for f in validate(cfg))
     assert "[user:no_hc1_hc2_dhw_hightemp_overlap]" in text
+
+
+def test_missing_automation_type(schedule_raw: dict, tmp_path: Path) -> None:
+    """Automation without type fails config_schema."""
+    data = copy.deepcopy(schedule_raw)
+    del data["automations"]["pool_gate"]["type"]
+    cfg = load_config(_write_tmp(tmp_path, data))
+    text = "\n".join(f.format() for f in validate(cfg))
+    assert "[builtin:config_schema]" in text
+    assert "missing or unknown type" in text
+
+
+def test_missing_duration_minutes(schedule_raw: dict, tmp_path: Path) -> None:
+    """no_overlap_above without duration_minutes errors."""
+    data = copy.deepcopy(schedule_raw)
+    for rule in data["rules"]["user"]:
+        if rule.get("id") == "no_hc1_hc2_dhw_hightemp_overlap":
+            for auto in rule.get("automations") or []:
+                auto.pop("duration_minutes", None)
+    cfg = load_config(_write_tmp(tmp_path, data))
+    text = "\n".join(f.format() for f in validate(cfg))
+    assert "missing duration_minutes" in text
+
+
+def test_bad_collect_ratio(schedule_raw: dict, tmp_path: Path) -> None:
+    """Collect ratio pointing at unknown metric fails."""
+    data = copy.deepcopy(schedule_raw)
+    data["collect"]["ratios"]["bad"] = {"num": "missing", "den": "consumed_kwh"}
+    cfg = load_config(_write_tmp(tmp_path, data))
+    text = "\n".join(f.format() for f in validate(cfg))
+    assert "[builtin:config_schema]" in text
+    assert "unknown num" in text

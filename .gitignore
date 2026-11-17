@@ -9,6 +9,7 @@ __pycache__/
 
 payloads/
 schedule*.yaml
+!schedule.example.yaml
 docs/plan/
 
 tests/ha.env

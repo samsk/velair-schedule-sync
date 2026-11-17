@@ -36,6 +36,8 @@ class ScheduleConfig:
     automations: Dict[str, Dict[str, Any]]
     legacy_disable: List[str]
     backup: Dict[str, Any]
+    collect: Dict[str, Any] = field(default_factory=dict)
+    scheduler: Dict[str, Any] = field(default_factory=dict)
     expectations: List[Dict[str, Any]] = field(default_factory=list)
 
 
@@ -85,6 +87,8 @@ def load_config(path: Path) -> ScheduleConfig:
         automations=dict(raw.get("automations") or {}),
         legacy_disable=list(raw.get("legacy_disable") or []),
         backup=dict(raw.get("backup") or {}),
+        collect=dict(raw.get("collect") or {}),
+        scheduler=dict(raw.get("scheduler") or {}),
         expectations=expectations,
     )
 

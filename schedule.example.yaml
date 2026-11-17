@@ -1,0 +1,238 @@
+# Copy to schedule.yaml and replace entity ids, windows, and sensors.
+# House facts stay in this file. The script stays generic.
+version: 1
+context:
+  summary: Preheat floors and radiators in the cheap window, then hold heat
+    through the day. Use midday only when outdoor temperature lifts COP.
+  tariff:
+    product: example dual tariff
+    ht_eur_per_kwh: 0.20
+    lt_eur_per_kwh: 0.12
+    lt_vs_ht: 0.6
+    note: Windows live under specifiers. Each calendar day resets.
+  house:
+    store: building mass
+  entity_roles:
+    climate.buffer: small high-temp store, charged at the end of low tariff
+    climate.radiators: living-space radiators
+    climate.floor: water underfloor, low temp, may overlap the buffer
+  design_notes:
+  - High-temp steps stay within 2.5 C and 15 min apart
+  - Do not stack buffer and radiators on the heat pump
+  - Buffer charges only inside an LT specifier
+  - Midday high tariff is a low-temp top-up unless COP justifies more
+  expectations:
+  - id: morning_comfort
+    target_min_c: 21
+    entities:
+    - climate.radiators
+    - climate.floor
+    note: rooms hold heat after the low-tariff preheat
+  - id: eheater_kwh
+    target: 0
+    unit: kWh
+    note: backup heater stays off
+specifiers:
+  LT_workday:
+    days: [mon, tue, wed, thu, fri]
+    start: '22:00'
+    end: '06:00'
+  LT_weekday_night: LT_workday
+  LT_weekend:
+    days: [sat, sun]
+    start: '02:00'
+    end: '08:00'
+  midday:
+    days: [mon, tue, wed, thu, fri, sat, sun]
+    start: '11:00'
+    end: '15:00'
+rules:
+  disable: null
+  user:
+  - id: buffer_step
+    type: max_step_up
+    entities: [climate.buffer]
+    limit_c: 2.5
+    min_gap_minutes: 15
+  - id: radiator_step
+    type: max_step_up
+    entities: [climate.radiators]
+    limit_c: 2.5
+    min_gap_minutes: 15
+  - id: buffer_only_in_lt
+    type: max_temp_outside
+    entities: [climate.buffer]
+    windows: [LT_workday, LT_weekend]
+    above_c: 19
+  - id: no_high_temp_stack
+    type: no_overlap_above
+    entities: [climate.buffer, climate.radiators]
+    above_c:
+      climate.buffer: 18
+      climate.radiators: 20.5
+    automations:
+    - name: dhw_charge
+      duration_minutes: 45
+reviews: []
+schedules:
+  climate.buffer:
+    mode: 5/2
+    temp_step: 0.5
+    weekday:
+    - time: LT+2:00
+      temp: 15.5
+      hvac_mode: heat
+    - ramp_to: 24
+      by: LT-0:30
+      step_c: 2.5
+      every: 0:30
+      hvac_mode: heat
+    - time: LT.end
+      temp: 15.5
+      hvac_mode: heat
+    weekend:
+    - time: 00:00
+      temp: 15.5
+      hvac_mode: heat
+    - ramp_to: 24
+      by: LT_weekend-0:30
+      step_c: 2.5
+      every: 0:30
+      hvac_mode: heat
+    - time: LT_weekend.end
+      temp: 15.5
+      hvac_mode: heat
+  climate.radiators:
+    mode: 5/2
+    temp_step: 0.5
+    weekday:
+    - time: LT+2:00
+      temp: 15.5
+      hvac_mode: heat
+    - time: LT+3:45
+      temp: 18
+      hvac_mode: heat
+    - time: LT+4:00
+      temp: 19.5
+      hvac_mode: heat
+    - time: LT+4:15
+      temp: 21
+      hvac_mode: heat
+    - time: LT+4:30
+      temp: 21.5
+      hvac_mode: heat
+    - time: LT-2:00
+      temp: 20.5
+      hvac_mode: heat
+    - time: '17:30'
+      temp: 15.5
+      hvac_mode: heat
+    weekend:
+    - time: 00:00
+      temp: 15.5
+      hvac_mode: heat
+    - time: LT_weekend+2:00
+      temp: 18
+      hvac_mode: heat
+    - time: LT_weekend+2:15
+      temp: 19.5
+      hvac_mode: heat
+    - time: LT_weekend+2:30
+      temp: 21
+      hvac_mode: heat
+    - time: LT_weekend+2:45
+      temp: 21.5
+      hvac_mode: heat
+    - time: LT_weekend-2:00
+      temp: 20.5
+      hvac_mode: heat
+    - time: '17:30'
+      temp: 15.5
+      hvac_mode: heat
+  climate.floor:
+    mode: 5/2
+    weekday:
+    - time: LT.start
+      temp: 19
+      hvac_mode: heat
+    - time: LT+1:00
+      temp: 21
+      hvac_mode: heat
+    - time: LT+3:00
+      temp: 21.5
+      hvac_mode: heat
+    - time: LT.end
+      temp: 20.5
+      hvac_mode: heat
+    - time: midday.start
+      temp: 21
+      hvac_mode: heat
+    - time: '17:00'
+      temp: 15.5
+      hvac_mode: heat
+    weekend:
+    - time: 00:00
+      temp: 15.5
+      hvac_mode: heat
+    - time: LT_weekend.start
+      temp: 20
+      hvac_mode: heat
+    - time: LT_weekend+1:00
+      temp: 21.5
+      hvac_mode: heat
+    - time: LT_weekend.end
+      temp: 20.5
+      hvac_mode: heat
+    - time: midday.start
+      temp: 21
+      hvac_mode: heat
+    - time: '17:00'
+      temp: 15.5
+      hvac_mode: heat
+scheduler:
+  status_sensor: sensor.heating_scheduler_scheduler_status
+  paused_state: paused
+collect:
+  period: hour
+  metrics:
+    consumed_kwh:
+      stat: sensor.heat_pump_energy
+      agg: state_sum
+    produced_kwh:
+      stat: sensor.heat_pump_heat
+      agg: state_sum
+    hdh:
+      stat: sensor.heating_degree_hours
+      agg: state_sum
+    outdoor_c:
+      stat: sensor.outdoor_temperature
+      agg: mean
+  ratios:
+    cop:
+      num: produced_kwh
+      den: consumed_kwh
+    kwh_per_hdh:
+      num: consumed_kwh
+      den: hdh
+automations:
+  outdoor_gate:
+    type: outdoor_gate
+    alias: Stop a circuit when outdoor is too cold
+    entity: climate.floor
+    outdoor_sensor: sensor.outdoor_temperature
+    min_outdoor_c: 5
+  dhw_charge:
+    type: time_switch
+    id: dhw_charge_example
+    alias: Charge domestic hot water in low tariff
+    entity: switch.dhw_charge
+    temp_sensor: sensor.dhw_temperature
+    below_c: 45
+    triggers:
+    - at: LT_workday+1:00
+      weekday: [mon, tue, wed, thu, fri]
+    - at: LT_weekend+1:00
+      weekday: [sat, sun]
+legacy_disable: []
+backup:
+  last: null

@@ -1,7 +1,16 @@
 # velair-schedule-sync
 
-Declarative heating schedules for Home Assistant.
+Declarative heating schedules for Home Assistant, written so an AI agent
+can tune them.
+
+The purpose of this project is to simplify scheduling of several heating
+circuits, especially on a heat pump: shift the load into the low-tariff
+window, or into hours when the outdoor temperature (and COP) is higher,
+then hold that heat through the day.
+
 `schedule.yaml` is the source of truth; the UI is not.
+Copy [`schedule.example.yaml`](schedule.example.yaml) to `schedule.yaml`
+to start a house.
 
 This repository was built and iterated with AI coding assistants under human
 direction. Maintainer review applies before anything runs on a live home.
@@ -32,14 +41,16 @@ Author and tune schedules with an AI agent:
 
 1. Point the agent at `AGENTS.md` (generic how-to: specifiers, ramps,
    linters, apply loop) and `schedule.yaml` (this house: entity roles,
-   tariff, design notes, sensors).
-2. Change yaml only — windows, offsets, temps, rules. Do not paste clock
-   times that a specifier already names.
+   tariff, design notes, `collect` metrics, automations).
+2. Change yaml only — windows, offsets, temps, rules, sensors. Do not
+   paste clock times that a specifier already names, and do not hardcode
+   house entity ids in the script.
 3. `make validate` / `make show` until linters pass and resolved nodes
    look right, then `make apply` (dry-run) and `make apply-yes` when
    asked.
 4. After a stretch of live data, `make collect` appends a `reviews`
-   entry. The agent reads that plus `context` to decide the next tweak.
+   entry from the top-level `collect` block. The agent reads that plus
+   `context` to decide the next tweak.
 
 The agent should never commit `.env` or `backups/`.
 
@@ -56,8 +67,8 @@ The agent should never commit `.env` or `backups/`.
 
 ## Run
 
-Copy `.env.example` to `.env` and set `HA_URL` / `HA_TOKEN`. All commands
-run via docker compose.
+Copy `schedule.example.yaml` to `schedule.yaml` and `.env.example` to
+`.env` (`HA_URL` / `HA_TOKEN`). All commands run via docker compose.
 
 ```bash
 make build
@@ -68,6 +79,7 @@ make test
 make apply              # dry-run diff
 make apply-yes          # write to HA
 make collect ARGS='--since 2026-11-15'
+make collect ARGS='--since 2026-11-15 --dry-run'
 make ha-up              # optional local HA on 127.0.0.1:8123
 make test-ha            # smoke test; needs tests/ha.env (localhost only)
 make help

@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 
 from lib.config import load_config
-from lib.resolve import nodes_to_cs_payload, resolve_day_nodes, schedule_keys
+from lib.resolve import nodes_to_cs_payload, resolve_day_nodes, resolve_time_triggers, schedule_keys
 from lib.timeutil import DAYS
 
 ROOT = Path(__file__).resolve().parent
@@ -37,16 +37,17 @@ def main() -> None:
                 nodes = resolve_day_nodes(cfg, key, day)
                 entry["days"][day] = nodes_to_cs_payload(nodes)
         out["schedules"][key] = entry
-    # tuv triggers exact
-    from lib.resolve import resolve_automation_trigger
 
-    tuv = []
-    for trig in (cfg.automations.get("tuv_charge") or {}).get("triggers") or []:
-        days = list(trig.get("weekday") or [])
-        for day, clock in resolve_automation_trigger(cfg, str(trig["at"]), days):
-            tuv.append({"day": day, "at": clock, "token": trig["at"]})
-    out["tuv_triggers"] = tuv
-    out["pool_gate"] = cfg.automations.get("pool_gate")
+    autos = {}
+    for name, auto in (cfg.automations or {}).items():
+        if not isinstance(auto, dict):
+            continue
+        item = dict(auto)
+        if auto.get("triggers"):
+            item["resolved_triggers"] = resolve_time_triggers(cfg, auto)
+        autos[name] = item
+    out["automations"] = autos
+
     dest = ROOT / "payloads"
     dest.mkdir(exist_ok=True)
     (dest / "apply.json").write_text(json.dumps(out, indent=2))
