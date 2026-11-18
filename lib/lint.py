@@ -33,6 +33,7 @@ BUILTIN_IDS = {
 AUTO_TYPES = {
     "outdoor_gate": ("entity", "outdoor_sensor", "min_outdoor_c"),
     "time_switch": ("id", "triggers"),
+    "season_select": ("id", "heating_season", "outdoor"),
 }
 
 USER_TYPES = {
@@ -930,11 +931,20 @@ def lint_config_schema(cfg: ScheduleConfig) -> List[Finding]:
     Returns:
         Findings.
     """
+    from .climate_profiles import (
+        PROTECTED_AUTOMATION_IDS,
+        SEASON_SELECT_ID,
+        schema_findings,
+    )
     from .collect import check_collect
 
     out: List[Finding] = []
     for msg in check_collect(cfg.collect or {}):
         out.append(Finding("builtin", "config_schema", "error", "collect", "-", msg))
+    for msg in schema_findings(cfg):
+        out.append(
+            Finding("builtin", "config_schema", "error", "climate_profiles", "-", msg)
+        )
     for name, auto in (cfg.automations or {}).items():
         if not isinstance(auto, dict):
             out.append(
@@ -973,6 +983,55 @@ def lint_config_schema(cfg: ScheduleConfig) -> List[Finding]:
                         f"missing required key {key}",
                     )
                 )
+        if atype == "season_select":
+            aid = str(auto.get("id") or "")
+            if aid != SEASON_SELECT_ID:
+                out.append(
+                    Finding(
+                        "builtin",
+                        "config_schema",
+                        "error",
+                        f"automations.{name}",
+                        "-",
+                        f"id must be {SEASON_SELECT_ID}",
+                    )
+                )
+            if aid in PROTECTED_AUTOMATION_IDS:
+                out.append(
+                    Finding(
+                        "builtin",
+                        "config_schema",
+                        "error",
+                        f"automations.{name}",
+                        "-",
+                        f"refuses protected automation id {aid}",
+                    )
+                )
+            if not cfg.climate_profiles:
+                out.append(
+                    Finding(
+                        "builtin",
+                        "config_schema",
+                        "error",
+                        f"automations.{name}",
+                        "-",
+                        "season_select needs climate_profiles",
+                    )
+                )
+    if cfg.climate_profiles and not any(
+        isinstance(a, dict) and a.get("type") == "season_select"
+        for a in (cfg.automations or {}).values()
+    ):
+        out.append(
+            Finding(
+                "builtin",
+                "config_schema",
+                "error",
+                "automations",
+                "-",
+                "climate_profiles needs a season_select automation",
+            )
+        )
     return out
 
 
@@ -987,41 +1046,132 @@ BUILTIN_LINTERS: Dict[str, Callable[..., List[Finding]]] = {
 }
 
 
-def validate(cfg: ScheduleConfig, *, strict: bool = False, profile: Optional[str] = None) -> List[Finding]:
+def _lint_resolved_key(
+    cfg: ScheduleConfig,
+    key: str,
+    *,
+    profile: Optional[str],
+    climate_profile: Optional[str],
+    disabled: Set[str],
+) -> List[Finding]:
+    """Lint one schedule key for Default or a climate profile.
+
+    Args:
+        cfg: Config.
+        key: Schedule key.
+        profile: Overlay profile.
+        climate_profile: Climate profile key.
+        disabled: Disabled linter ids.
+    Returns:
+        Findings.
+    """
+    from .climate_profiles import resolve_climate_profile_day
+
+    findings: List[Finding] = []
+    for day in DAYS:
+        try:
+            if climate_profile:
+                nodes = resolve_climate_profile_day(cfg, climate_profile, key, day)
+            else:
+                nodes = resolve_day_nodes(cfg, key, day, profile=profile)
+        except Exception as exc:
+            findings.append(Finding("builtin", "resolve", "error", key, day, str(exc)))
+            continue
+        for lid, fn in BUILTIN_LINTERS.items():
+            if lid in disabled:
+                continue
+            findings.extend(fn(cfg, key, day, nodes))
+    if not climate_profile and "midnight_transition" not in disabled:
+        try:
+            findings.extend(lint_midnight_transition(cfg, key))
+        except Exception as exc:
+            findings.append(
+                Finding("builtin", "midnight_transition", "error", key, "all", str(exc))
+            )
+    return findings
+
+
+def validate(
+    cfg: ScheduleConfig,
+    *,
+    strict: bool = False,
+    profile: Optional[str] = None,
+    climate_profile: Optional[str] = None,
+) -> List[Finding]:
     """Run all linters.
 
     Args:
         cfg: Config.
         strict: Promote warn to error for exit status.
-        profile: Optional profile to include.
+        profile: Optional overlay profile to include.
+        climate_profile: Optional climate profile to lint instead.
     Returns:
         All findings.
     """
+    from .climate_profiles import climate_profile_keys, parse_climate_profiles
+
     disabled = _disabled(cfg)
     findings: List[Finding] = []
     if "config_schema" not in disabled:
         findings.extend(lint_config_schema(cfg))
-    keys = schedule_keys(cfg, profile)
 
-    for key in keys:
-        for day in DAYS:
-            try:
-                nodes = resolve_day_nodes(cfg, key, day, profile=profile)
-            except Exception as exc:
-                findings.append(
-                    Finding("builtin", "resolve", "error", key, day, str(exc))
+    if climate_profile:
+        try:
+            keys = climate_profile_keys(cfg, climate_profile)
+            parse_climate_profiles(cfg)
+        except Exception as exc:
+            findings.append(
+                Finding(
+                    "builtin",
+                    "resolve",
+                    "error",
+                    "climate_profiles",
+                    climate_profile,
+                    str(exc),
                 )
-                continue
-            for lid, fn in BUILTIN_LINTERS.items():
-                if lid in disabled:
-                    continue
-                findings.extend(fn(cfg, key, day, nodes))
-        if "midnight_transition" not in disabled:
+            )
+            keys = []
+        for key in keys:
+            findings.extend(
+                _lint_resolved_key(
+                    cfg,
+                    key,
+                    profile=None,
+                    climate_profile=climate_profile,
+                    disabled=disabled,
+                )
+            )
+    else:
+        keys = schedule_keys(cfg, profile)
+        for key in keys:
+            findings.extend(
+                _lint_resolved_key(
+                    cfg, key, profile=profile, climate_profile=None, disabled=disabled
+                )
+            )
+        if cfg.climate_profiles:
             try:
-                findings.extend(lint_midnight_transition(cfg, key))
+                for spec in parse_climate_profiles(cfg):
+                    for key in climate_profile_keys(cfg, spec.key):
+                        findings.extend(
+                            _lint_resolved_key(
+                                cfg,
+                                key,
+                                profile=None,
+                                climate_profile=spec.key,
+                                disabled=disabled,
+                            )
+                        )
             except Exception as exc:
                 findings.append(
-                    Finding("builtin", "midnight_transition", "error", key, "all", str(exc))
+                    Finding(
+                        "builtin",
+                        "resolve",
+                        "error",
+                        "climate_profiles",
+                        "-",
+                        str(exc),
+                    )
                 )
 
     if "rule_threshold_sanity" not in disabled:

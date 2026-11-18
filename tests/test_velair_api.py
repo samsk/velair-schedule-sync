@@ -91,6 +91,7 @@ def test_temp_step_from_fractional() -> None:
         reviews=[],
         schedules={"climate.x": {}},
         profiles={},
+        climate_profiles={},
         groups={},
         automations={},
         legacy_disable=[],

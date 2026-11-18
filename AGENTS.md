@@ -90,14 +90,46 @@ Start a new house from `schedule.example.yaml`.
   `den` gives `null`. Check which agg fits a sensor by looking at its raw
   statistic rows before trusting a number.
 - `scheduler` — optional `{status_sensor, paused_state}` for `test`.
-- `groups`, `profiles`, `automations`, `legacy_disable`, `backup`.
+- `groups`, `profiles`, `climate_profiles`, `automations`,
+  `legacy_disable`, `backup`.
+- `profiles` — apply-time overlay into Default (`apply --profile`). Not a
+  live Velair seasonal profile.
+- `climate_profiles` — alternate Velair weeks selected by Home Assistant.
+  Each entry has `mode`, unique `priority`, and `when`. Hold form uses
+  `zones` (all-day temp). Offset form uses `from: default`, `offset_c`
+  (negative), and `entities`. Exactly one profile has
+  `when.heating_season: off` and must hold the highest priority.
 - `automations.<name>` — required `type`:
   - `outdoor_gate`: `entity`, `outdoor_sensor`, `min_outdoor_c`
     (optional `id`, `fallback_script`, `alias`, `labels`)
   - `time_switch`: `id`, `triggers` (`at` specifier token + `weekday`
     list; optional `entity` + `temp_sensor` + `below_c`, `alias`,
     `labels`)
+  - `season_select`: `id: velair_season_select`, `heating_season`,
+    `outdoor`. Selects `select.velair_mode` by priority; never activates
+    profiles from `apply` itself.
 - `reviews` — append-only log, written by `collect` or by the agent.
+
+## Seasonal climate profiles
+
+- Read `climate_profiles`, conditions, priorities, and the last
+  profile-related review before changing them.
+- Treat `schedules` as Default and `climate_profiles` as alternate Velair
+  profiles. Never use the existing `profiles` key for live seasonal
+  profiles.
+- Evaluate conditions by descending explicit priority. Off season must
+  remain highest; Default is the final fallback.
+- Keep profile changes small: one band, offset, or hold per phase. Do not
+  silently alter Default schedules while tuning a profile.
+- Run `make validate ARGS='--strict'`, then
+  `make show ARGS='--climate-profile cold --entity climate.hc2 --day mon'`
+  (and every affected key). Confirm clocks, snapped temps, expanded
+  groups, and the priority winner.
+- Dry-run `make apply` and verify only intended Default, profile, mode,
+  and managed automation diffs. Apply must not activate, delete, or
+  restore a profile. `apply --profile Summer` skips climate_profiles.
+- Never run `apply-yes` unless asked in that turn. Record active profile,
+  thresholds, priority, period, and result in `reviews` / `data_used`.
 
 ## Schedule nodes
 
@@ -161,6 +193,7 @@ All commands run in docker via `make` (`docker compose`).
 ```
 make validate ARGS='--strict'
 make show ARGS='--entity climate.hc1 --day mon'
+make show ARGS='--climate-profile cold --entity climate.hc2 --day mon'
 make check                          # offline pytest + fake HA
 make test                           # HA connection, read-only
 make collect ARGS='--since <date> --dry-run'

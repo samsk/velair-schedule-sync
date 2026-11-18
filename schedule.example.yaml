@@ -214,7 +214,36 @@ collect:
     kwh_per_hdh:
       num: consumed_kwh
       den: hdh
+# Optional Velair seasonal profiles. schedules stay Default; Home Assistant
+# selects select.velair_mode by priority. Off season must be highest.
+climate_profiles:
+  off_season:
+    mode: Off season
+    priority: 100
+    when:
+      heating_season: 'off'
+    zones:
+      climate.radiators: {temp: 15.5, hvac_mode: heat}
+      climate.floor: {temp: 15.5, hvac_mode: heat}
+  cold:
+    mode: Cold
+    priority: 50
+    when:
+      heating_season: 'on'
+      outdoor_at_or_below_c: -20
+      for_minutes: 30
+    from: default
+    offset_c: -1
+    entities:
+    - climate.radiators
+    - climate.floor
 automations:
+  season_select:
+    type: season_select
+    id: velair_season_select
+    alias: Velair season profile select
+    heating_season: binary_sensor.heating_season
+    outdoor: sensor.outdoor_temperature
   outdoor_gate:
     type: outdoor_gate
     alias: Stop a circuit when outdoor is too cold

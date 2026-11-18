@@ -116,6 +116,10 @@ class FakeHaState:
         }
         self.writes: List[str] = []
         self.turn_off_calls: List[str] = []
+        self.profiles: Dict[str, Dict[str, Any]] = {}
+        self.modes: Dict[str, Dict[str, Any]] = {}
+        self.active_profile_ids: List[str] = []
+        self.forbidden_calls: List[str] = []
 
     def schedule_payload(self) -> Dict[str, Any]:
         """Build velair/get_schedule result.
@@ -135,8 +139,19 @@ class FakeHaState:
             "configured_entities": list(CLIMATES),
             "room_groups": {},
             "control_units": list(CLIMATES),
-            "global": {"mode": "paused"},
+            "global": {
+                "mode": "paused",
+                "active_profile_ids": list(self.active_profile_ids),
+                "base_profile_ids": list(self.active_profile_ids),
+            },
             "zones": zones,
+            "profiles": [
+                {"key": key, **value} for key, value in self.profiles.items()
+            ],
+            "modes": [
+                {"key": key, **value} for key, value in self.modes.items()
+            ],
+            "active_profile_ids": list(self.active_profile_ids),
             "settings": {
                 "min_temperature": 5.0,
                 "max_temperature": 35.0,
@@ -387,6 +402,18 @@ class FakeHaServer:
                         state.writes.append(f"switch.turn_off {eid}")
                         self._json(200, [])
                         return
+                    if domain == "select" and service == "select_option":
+                        state.forbidden_calls.append(
+                            f"select.select_option {payload.get('option')}"
+                        )
+                        state.writes.append("select.select_option")
+                        self._json(200, [])
+                        return
+                    if domain == "velair" and service == "activate_profile":
+                        state.forbidden_calls.append("velair.activate_profile")
+                        state.writes.append("velair.activate_profile")
+                        self._json(200, [])
+                        return
                     if domain == "velair" and service == "set_daily_schedule":
                         eid = str(payload.get("entity_id"))
                         weekday = str(payload.get("weekday"))
@@ -485,6 +512,72 @@ class FakeHaServer:
                                 "type": "result",
                                 "success": True,
                                 "result": state.schedule_payload(),
+                            },
+                        )
+                        continue
+                    if mtype == "velair/set_profile":
+                        expected = msg.get("expected_revision")
+                        if expected is not None and int(expected) != state.revision:
+                            self._ws_send(
+                                sock,
+                                {
+                                    "id": msg_id,
+                                    "type": "result",
+                                    "success": False,
+                                    "error": {
+                                        "code": "revision_mismatch",
+                                        "message": "revision mismatch",
+                                    },
+                                },
+                            )
+                            continue
+                        profile = dict(msg.get("profile") or {})
+                        key = str(profile.get("key") or "")
+                        state.profiles[key] = profile
+                        state.revision += 1
+                        state.writes.append(f"set_profile {key}")
+                        self._ws_send(
+                            sock,
+                            {
+                                "id": msg_id,
+                                "type": "result",
+                                "success": True,
+                                "result": state.schedule_payload(),
+                            },
+                        )
+                        continue
+                    if mtype == "velair/set_mode":
+                        mode = dict(msg.get("mode") or {})
+                        key = str(mode.get("key") or "")
+                        state.modes[key] = mode
+                        state.revision += 1
+                        state.writes.append(f"set_mode {key}")
+                        self._ws_send(
+                            sock,
+                            {
+                                "id": msg_id,
+                                "type": "result",
+                                "success": True,
+                                "result": state.schedule_payload(),
+                            },
+                        )
+                        continue
+                    if mtype in (
+                        "velair/activate_profile",
+                        "velair/activate_profiles",
+                        "velair/select_mode",
+                        "velair/delete_profile",
+                        "velair/delete_mode",
+                    ):
+                        state.forbidden_calls.append(str(mtype))
+                        state.writes.append(str(mtype))
+                        self._ws_send(
+                            sock,
+                            {
+                                "id": msg_id,
+                                "type": "result",
+                                "success": True,
+                                "result": {},
                             },
                         )
                         continue

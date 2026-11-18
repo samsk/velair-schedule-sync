@@ -149,7 +149,12 @@ def cmd_validate(args: argparse.Namespace) -> int:
         Exit code.
     """
     cfg = _cfg(args.config)
-    findings = validate(cfg, strict=args.strict, profile=args.profile)
+    findings = validate(
+        cfg,
+        strict=args.strict,
+        profile=args.profile,
+        climate_profile=args.climate_profile,
+    )
     for f in findings:
         print(f.format())
     code = exit_code(findings)
@@ -166,6 +171,8 @@ def cmd_show(args: argparse.Namespace) -> int:
     Returns:
         Exit code.
     """
+    from lib.climate_profiles import resolve_climate_profile_day
+
     cfg = _cfg(args.config)
     if args.entity:
         key = args.entity
@@ -174,10 +181,20 @@ def cmd_show(args: argparse.Namespace) -> int:
     else:
         print("need --entity or --group", file=sys.stderr)
         return 2
+    if args.profile and args.climate_profile:
+        print("use only one of --profile and --climate-profile", file=sys.stderr)
+        return 2
     days = expand_days(args.day)
     for day in days:
-        nodes = resolve_day_nodes(cfg, key, day, profile=args.profile)
-        print(f"# {key} {day}")
+        if args.climate_profile:
+            nodes = resolve_climate_profile_day(cfg, args.climate_profile, key, day)
+            label = f"climate_profile={args.climate_profile}"
+        else:
+            nodes = resolve_day_nodes(cfg, key, day, profile=args.profile)
+            label = day
+        print(f"# {key} {label if args.climate_profile else day}")
+        if args.climate_profile:
+            print(f"# day {day}")
         print(format_nodes(nodes, args.format), end="")
     return 0
 
@@ -210,6 +227,9 @@ def _backup_payload(cfg: ScheduleConfig, client: HaClient) -> Dict[str, Any]:
             for eid, zone in (live.get("zones") or {}).items()
             if isinstance(zone, dict)
         }
+        snap["profiles"] = live.get("profiles") or []
+        snap["modes"] = live.get("modes") or []
+        snap["active_profile_ids"] = velair_api.active_profile_ids(live)
     else:
         for key in schedule_keys(cfg):
             try:
@@ -507,6 +527,11 @@ def _apply_velair(
         print("NOTE: scheduler is paused; saved blocks do not run until resumed")
     zones = live.get("zones") or {}
     revision: Optional[int] = None
+    if live.get("configuration_revision") is not None:
+        try:
+            revision = int(live.get("configuration_revision"))
+        except (TypeError, ValueError):
+            revision = None
 
     for key in schedule_keys(cfg, profile):
         targets = _velair_targets(cfg, key, live)
@@ -548,6 +573,18 @@ def _apply_velair(
                     result = velair_api.set_day(client, ent, day, blocks, revision)
                     revision = _revision_from(result) or revision
 
+    # Seasonal climate profiles only on a normal apply (not --profile overlay).
+    if profile is None and cfg.climate_profiles:
+        if not dry:
+            live = velair_api.fetch_schedule(client)
+            try:
+                revision = int(live.get("configuration_revision"))
+            except (TypeError, ValueError):
+                revision = None
+        code = _apply_climate_profiles(cfg, client, live, dry, revision)
+        if code != 0:
+            return code
+
     _apply_automations(cfg, client, dry)
     for sw in cfg.legacy_disable:
         st = client.get_state(sw)
@@ -559,6 +596,76 @@ def _apply_velair(
         else:
             print(f"legacy {sw}: {cur or 'missing'}")
     print("0 writes" if dry else f"writes={client.writes}")
+    return 0
+
+
+def _apply_climate_profiles(
+    cfg: ScheduleConfig,
+    client: HaClient,
+    live: Dict[str, Any],
+    dry: bool,
+    revision: Optional[int],
+) -> int:
+    """Upsert Velair climate profiles and modes without activating.
+
+    Args:
+        cfg: Config.
+        client: HA client.
+        live: Current get_schedule payload.
+        dry: Dry-run flag.
+        revision: Expected configuration revision.
+    Returns:
+        Exit code.
+    """
+    from lib.climate_profiles import (
+        parse_climate_profiles,
+        set_mode_body,
+        set_profile_body,
+    )
+
+    try:
+        specs = parse_climate_profiles(cfg)
+    except ValueError as exc:
+        print(f"climate_profiles: {exc}")
+        return 1
+    known = set(velair_api.known_profile_keys(live))
+    active = set(velair_api.active_profile_ids(live))
+    yaml_keys = {s.key for s in specs}
+    for orphan in sorted(known - yaml_keys):
+        print(f"climate_profile {orphan}: in Velair but not yaml; left in place")
+    zones = live.get("zones") or {}
+    for spec in specs:
+        body = set_profile_body(cfg, spec)
+        zone_ids = sorted(body["zones"].keys())
+        missing = [z for z in zone_ids if z not in zones]
+        if missing:
+            print(f"climate_profile {spec.key}: not managed by Velair: {missing}")
+            return 1
+        action = "update" if spec.key in known else "create"
+        print(
+            f"climate_profile {spec.key}: {action} zones={zone_ids} "
+            f"mode={spec.mode!r} priority={spec.priority}"
+        )
+        if spec.key in active:
+            print(
+                f"climate_profile {spec.key}: ACTIVE; saving changes the running week"
+            )
+        if dry:
+            continue
+        try:
+            result = velair_api.set_profile(
+                client, body, expected_revision=revision
+            )
+        except Exception as exc:
+            print(f"climate_profile {spec.key}: set_profile failed: {exc}")
+            return 1
+        revision = _revision_from(result) or revision
+        try:
+            mode_result = velair_api.set_mode(client, set_mode_body(spec))
+        except Exception as exc:
+            print(f"climate_profile {spec.key}: set_mode failed: {exc}")
+            return 1
+        revision = _revision_from(mode_result) or revision
     return 0
 
 
@@ -578,6 +685,8 @@ def cmd_apply(args: argparse.Namespace) -> int:
     if errors:
         print("validate failed; abort apply")
         return 1
+    if args.profile and cfg.climate_profiles:
+        print("NOTE: --profile skips climate_profiles push")
 
     dry = not args.yes
     client = load_connection(args.url, args.token, ROOT)
@@ -921,6 +1030,52 @@ def _apply_time_switch(
         _apply_automation_labels(client, str(aid), auto, dry=True)
 
 
+def _apply_season_select(
+    cfg: ScheduleConfig,
+    name: str,
+    auto: Dict[str, Any],
+    client: HaClient,
+    dry: bool,
+) -> None:
+    """Upsert season_select automation.
+
+    Args:
+        cfg: Config.
+        name: Automation key.
+        auto: Automation block.
+        client: HA client.
+        dry: Dry-run flag.
+    """
+    from lib.climate_profiles import (
+        PROTECTED_AUTOMATION_IDS,
+        SEASON_SELECT_ID,
+        season_select_automation,
+    )
+
+    aid = str(auto.get("id") or SEASON_SELECT_ID)
+    if aid in PROTECTED_AUTOMATION_IDS:
+        raise RuntimeError(f"automations.{name}: refuses protected id {aid}")
+    conf = season_select_automation(cfg, auto)
+    print(f"automation {name} id={aid}")
+    print(f"{name} triggers -> {conf['triggers']}")
+    print(f"{name} actions -> choose modes + Default")
+    if not dry:
+        try:
+            existing = client.get_automation_config(str(aid))
+        except Exception:
+            existing = None
+        if not isinstance(existing, dict):
+            existing = {"id": str(aid), "mode": "single"}
+            print(f"created {name} id={aid}")
+        for old in ("trigger", "condition", "action"):
+            existing.pop(old, None)
+        existing.update(conf)
+        client.set_automation_config(str(aid), existing)
+        _apply_automation_labels(client, str(aid), auto, dry=False)
+    else:
+        _apply_automation_labels(client, str(aid or name), auto, dry=True)
+
+
 def _apply_automations(cfg: ScheduleConfig, client: HaClient, dry: bool) -> None:
     """Upsert typed automations plus labels.
 
@@ -937,6 +1092,8 @@ def _apply_automations(cfg: ScheduleConfig, client: HaClient, dry: bool) -> None
             _apply_outdoor_gate(name, auto, client, dry)
         elif atype == "time_switch":
             _apply_time_switch(cfg, name, auto, client, dry)
+        elif atype == "season_select":
+            _apply_season_select(cfg, name, auto, client, dry)
         else:
             raise RuntimeError(f"automations.{name}: unknown type {atype!r}")
 
@@ -1010,6 +1167,7 @@ def build_parser() -> argparse.ArgumentParser:
     v = sub.add_parser("validate", help="Lint schedule offline")
     v.add_argument("--strict", action="store_true")
     v.add_argument("--profile", default=None)
+    v.add_argument("--climate-profile", default=None)
     v.set_defaults(func=cmd_validate)
 
     s = sub.add_parser("show", help="Show resolved schedule")
@@ -1018,6 +1176,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--day", default="all")
     s.add_argument("--format", choices=["ascii", "csv"], default="ascii")
     s.add_argument("--profile", default=None)
+    s.add_argument("--climate-profile", default=None)
     s.set_defaults(func=cmd_show)
 
     b = sub.add_parser("backup", help="Backup live schedules")

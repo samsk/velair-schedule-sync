@@ -119,3 +119,103 @@ def test_apply_yes_stores_blocks_and_triggers(fake_ha: FakeHaServer, tmp_path: P
 
     raw = yaml.safe_load(config.read_text())
     assert str(raw.get("backup", {}).get("last", "")).startswith("backups/")
+
+
+def test_apply_climate_profiles_without_activate(
+    fake_ha: FakeHaServer, tmp_path: Path
+) -> None:
+    """apply upserts profiles and season automation without activating."""
+    raw = yaml.safe_load(FIXTURE.read_text())
+    raw["groups"] = {
+        "Kids": {"entities": ["climate.heating_eh1", "climate.heating_eh2"]}
+    }
+    raw["schedules"]["climate.hc2"] = {
+        "mode": "5/2",
+        "temp_step": 0.5,
+        "weekday": [
+            {"time": "00:00", "temp": 15.5, "hvac_mode": "heat"},
+            {"time": "06:00", "temp": 18, "hvac_mode": "heat"},
+            {"time": "17:00", "temp": 15.5, "hvac_mode": "heat"},
+        ],
+        "weekend": [
+            {"time": "00:00", "temp": 15.5, "hvac_mode": "heat"},
+            {"time": "08:00", "temp": 18, "hvac_mode": "heat"},
+            {"time": "17:00", "temp": 15.5, "hvac_mode": "heat"},
+        ],
+    }
+    raw["schedules"]["group:Kids"] = {
+        "mode": "5/2",
+        "temp_step": 0.5,
+        "weekday": [
+            {"time": "00:00", "temp": 19, "hvac_mode": "heat"},
+            {"time": "06:00", "temp": 20, "hvac_mode": "heat"},
+            {"time": "20:00", "temp": 19, "hvac_mode": "heat"},
+        ],
+        "weekend": [
+            {"time": "00:00", "temp": 19, "hvac_mode": "heat"},
+        ],
+    }
+    raw["climate_profiles"] = {
+        "off_season": {
+            "mode": "Off season",
+            "priority": 100,
+            "when": {"heating_season": "off"},
+            "zones": {
+                "climate.hc1": {"temp": 15.5, "hvac_mode": "heat"},
+                "climate.hc2": {"temp": 15.5, "hvac_mode": "heat"},
+                "group:Kids": {"temp": 19, "hvac_mode": "heat"},
+            },
+        },
+        "cold": {
+            "mode": "Cold",
+            "priority": 50,
+            "when": {
+                "heating_season": "on",
+                "outdoor_at_or_below_c": -20,
+                "for_minutes": 30,
+            },
+            "from": "default",
+            "offset_c": -1,
+            "entities": ["climate.hc2", "group:Kids"],
+        },
+    }
+    raw["automations"]["season_select"] = {
+        "type": "season_select",
+        "id": "velair_season_select",
+        "alias": "Velair season profile select",
+        "heating_season": "binary_sensor.heating_season",
+        "outdoor": "sensor.outdoor_temperature",
+        "labels": ["heating"],
+    }
+    config = tmp_path / "house_profiles.yaml"
+    config.write_text(yaml.safe_dump(raw, sort_keys=False))
+
+    dry = _run_apply(config, fake_ha.url, "--dry-run")
+    assert dry.returncode == 0, dry.stdout + dry.stderr
+    assert "climate_profile cold:" in dry.stdout
+    assert fake_ha.state.forbidden_calls == []
+    assert not any("set_profile" in w for w in fake_ha.state.writes)
+
+    result = _run_apply(config, fake_ha.url, "--yes")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "cold" in fake_ha.state.profiles
+    assert "off_season" in fake_ha.state.profiles
+    assert "cold" in fake_ha.state.modes
+    assert fake_ha.state.modes["cold"]["profile_ids"] == ["cold"]
+    assert "climate.hc1" not in fake_ha.state.profiles["cold"]["zones"]
+    assert "climate.heating_eh1" in fake_ha.state.profiles["cold"]["zones"]
+    season = fake_ha.state.automations["velair_season_select"]
+    assert any(t.get("above") == -20 for t in season["triggers"])
+    assert any(t.get("below") == -20 for t in season["triggers"])
+    assert fake_ha.state.forbidden_calls == []
+    assert not any("activate" in w for w in fake_ha.state.writes)
+    assert not any(w == "select.select_option" for w in fake_ha.state.writes)
+
+    # overlay apply must not push climate profiles
+    before = list(fake_ha.state.writes)
+    overlay = _run_apply(config, fake_ha.url, "--yes", "--profile", "Summer")
+    assert overlay.returncode == 0, overlay.stdout + overlay.stderr
+    assert "skips climate_profiles" in overlay.stdout or "NOTE: --profile" in overlay.stdout
+    new_writes = fake_ha.state.writes[len(before) :]
+    assert not any(w.startswith("set_profile") for w in new_writes)
+    assert not any(w.startswith("set_mode") for w in new_writes)

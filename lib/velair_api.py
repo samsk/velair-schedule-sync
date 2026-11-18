@@ -246,3 +246,76 @@ def set_temp_step(client: HaClient, entity_id: str, step: float) -> None:
         {"entity_id": entity_id, "target_temp_step": step},
         write=True,
     )
+
+
+def set_profile(
+    client: HaClient,
+    profile: Dict[str, Any],
+    *,
+    expected_revision: Optional[int] = None,
+) -> Any:
+    """Create or update a Velair climate profile.
+
+    Args:
+        client: HA client.
+        profile: Profile body with key, name, zones.
+        expected_revision: Optional concurrency token.
+    Returns:
+        Websocket result.
+    """
+    fields: Dict[str, Any] = {"profile": profile}
+    if expected_revision is not None:
+        fields["expected_revision"] = expected_revision
+    return client.ws_command("velair/set_profile", fields, write=True)
+
+
+def set_mode(
+    client: HaClient,
+    mode: Dict[str, Any],
+) -> Any:
+    """Create or update a Velair mode.
+
+    Args:
+        client: HA client.
+        mode: Mode body with key, name, profile_ids.
+    Returns:
+        Websocket result.
+    """
+    return client.ws_command("velair/set_mode", {"mode": mode}, write=True)
+
+
+def active_profile_ids(schedule: Dict[str, Any]) -> List[str]:
+    """Active base profile ids from a get_schedule payload.
+
+    Args:
+        schedule: velair/get_schedule result.
+    Returns:
+        Profile id list.
+    """
+    ids = schedule.get("active_profile_ids")
+    if isinstance(ids, list):
+        return [str(x) for x in ids]
+    global_state = schedule.get("global") or {}
+    ids = global_state.get("active_profile_ids") or global_state.get("base_profile_ids")
+    if isinstance(ids, list):
+        return [str(x) for x in ids]
+    return []
+
+
+def known_profile_keys(schedule: Dict[str, Any]) -> List[str]:
+    """Saved profile keys.
+
+    Args:
+        schedule: get_schedule result.
+    Returns:
+        Keys.
+    """
+    profiles = schedule.get("profiles") or []
+    out: List[str] = []
+    if isinstance(profiles, list):
+        for item in profiles:
+            if isinstance(item, dict) and item.get("key"):
+                out.append(str(item["key"]))
+    elif isinstance(profiles, dict):
+        out.extend(str(k) for k in profiles.keys())
+    return out

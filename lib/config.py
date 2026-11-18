@@ -32,6 +32,7 @@ class ScheduleConfig:
     reviews: List[Dict[str, Any]]
     schedules: Dict[str, Dict[str, Any]]
     profiles: Dict[str, Dict[str, Any]]
+    climate_profiles: Dict[str, Dict[str, Any]]
     groups: Dict[str, Dict[str, Any]]
     automations: Dict[str, Dict[str, Any]]
     legacy_disable: List[str]
@@ -83,6 +84,7 @@ def load_config(path: Path) -> ScheduleConfig:
         reviews=list(raw.get("reviews") or []),
         schedules=dict(raw.get("schedules") or {}),
         profiles=dict(raw.get("profiles") or {}),
+        climate_profiles=dict(raw.get("climate_profiles") or {}),
         groups=dict(raw.get("groups") or {}),
         automations=dict(raw.get("automations") or {}),
         legacy_disable=list(raw.get("legacy_disable") or []),
