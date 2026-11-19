@@ -221,27 +221,29 @@ def set_day(
         blocks: Velair blocks.
         revision: Optional configuration revision.
     Returns:
-        Service response.
+        Schedule payload (includes configuration_revision).
     """
-    data: Dict[str, Any] = {
+    fields: Dict[str, Any] = {
         "entity_id": entity_id,
         "weekday": weekday,
         "blocks": blocks,
     }
     if revision is not None:
-        data["expected_revision"] = revision
-    return client.call_service("velair", "set_daily_schedule", data, write=True, return_response=False)
+        fields["expected_revision"] = revision
+    return client.ws_command("velair/set_daily_schedule", fields, write=True)
 
 
-def set_temp_step(client: HaClient, entity_id: str, step: float) -> None:
+def set_temp_step(client: HaClient, entity_id: str, step: float) -> Any:
     """Save a fallback target step when the climate does not publish one.
 
     Args:
         client: HA client.
         entity_id: Managed climate.
         step: Step in degrees, such as 0.5.
+    Returns:
+        Schedule payload (includes configuration_revision).
     """
-    client.ws_command(
+    return client.ws_command(
         "velair/update_zone_target_temp_step",
         {"entity_id": entity_id, "target_temp_step": step},
         write=True,

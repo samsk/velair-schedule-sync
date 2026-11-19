@@ -385,7 +385,7 @@ def velair_zone_payload(
             for ent in expand_schedule_key(cfg, key):
                 zones[ent] = {
                     "behavior": "schedule",
-                    "day_layout_key": "all_days",
+                    "day_layout_key": "all",
                     "schedule": schedule,
                     "template_links": {},
                 }
@@ -412,7 +412,7 @@ def velair_zone_payload(
                 schedule[d] = list(weekday)
             for d in ("saturday", "sunday"):
                 schedule[d] = list(weekend)
-            layout = "weekday_weekend"
+            layout = "weekdays_weekend"
         elif mode == "all_days":
             blocks = [
                 node_to_block(n)
@@ -421,7 +421,7 @@ def velair_zone_payload(
                 )
             ]
             schedule = {DAY_NAME[d]: list(blocks) for d in DAYS}
-            layout = "all_days"
+            layout = "all"
         else:
             for day in DAYS:
                 schedule[DAY_NAME[day]] = [

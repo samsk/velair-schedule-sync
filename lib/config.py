@@ -42,6 +42,23 @@ class ScheduleConfig:
     expectations: List[Dict[str, Any]] = field(default_factory=list)
 
 
+def _active_climate_profiles(raw: Any) -> Dict[str, Dict[str, Any]]:
+    """Climate profiles for apply/lint, empty when enabled is false.
+
+    Args:
+        raw: climate_profiles mapping from yaml.
+    Returns:
+        Profile entries without the enabled flag.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    data = dict(raw)
+    enabled = data.pop("enabled", True)
+    if enabled is False:
+        return {}
+    return {str(k): dict(v) for k, v in data.items() if isinstance(v, dict)}
+
+
 def load_config(path: Path) -> ScheduleConfig:
     """Load schedule yaml into typed config.
 
@@ -84,7 +101,7 @@ def load_config(path: Path) -> ScheduleConfig:
         reviews=list(raw.get("reviews") or []),
         schedules=dict(raw.get("schedules") or {}),
         profiles=dict(raw.get("profiles") or {}),
-        climate_profiles=dict(raw.get("climate_profiles") or {}),
+        climate_profiles=_active_climate_profiles(raw.get("climate_profiles")),
         groups=dict(raw.get("groups") or {}),
         automations=dict(raw.get("automations") or {}),
         legacy_disable=list(raw.get("legacy_disable") or []),

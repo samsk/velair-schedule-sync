@@ -450,6 +450,51 @@ def _revision_from(result: Any) -> Optional[int]:
     return None
 
 
+def _is_revision_conflict(exc: BaseException) -> bool:
+    """True when Velair rejected a stale configuration_revision.
+
+    Args:
+        exc: Raised error.
+    Returns:
+        Whether the message is a revision conflict.
+    """
+    text = str(exc).lower()
+    return "configuration changed" in text or "revision" in text
+
+
+def _set_day_refreshing(
+    client: HaClient,
+    entity_id: str,
+    day: str,
+    blocks: List[Dict[str, Any]],
+    revision: Optional[int],
+) -> Optional[int]:
+    """Write one day, refresh revision, retry once on conflict.
+
+    Args:
+        client: HA client.
+        entity_id: Climate entity.
+        day: Full weekday name.
+        blocks: Velair blocks.
+        revision: Expected configuration revision.
+    Returns:
+        Latest revision after the write.
+    """
+    try:
+        result = velair_api.set_day(client, entity_id, day, blocks, revision)
+        return _revision_from(result) or revision
+    except Exception as exc:
+        if not _is_revision_conflict(exc):
+            raise
+        live = velair_api.fetch_schedule(client)
+        try:
+            revision = int(live.get("configuration_revision"))
+        except (TypeError, ValueError):
+            revision = None
+        result = velair_api.set_day(client, entity_id, day, blocks, revision)
+        return _revision_from(result) or revision
+
+
 def _temp_step(
     cfg: ScheduleConfig, key: str, desired: Dict[str, List[Dict[str, Any]]]
 ) -> Optional[float]:
@@ -546,32 +591,48 @@ def _apply_velair(
             step = _temp_step(cfg, key, desired)
             if step is not None:
                 for ent in targets:
+                    zone = zones.get(ent) or {}
+                    current = zone.get("target_temp_step_override")
+                    if current is not None and float(current) == float(step):
+                        print(f"{ent}: target_temp_step={step} (unchanged)")
+                        continue
                     print(f"{ent}: target_temp_step={step}")
-                    velair_api.set_temp_step(client, ent, float(step))
+                    result = velair_api.set_temp_step(client, ent, float(step))
+                    revision = _revision_from(result) or revision
         for label, nodes in desired.items():
             days = velair_api.days_for_label(label)
             blocks = velair_api.nodes_to_blocks(nodes)
             shared = velair_api.shared_nodes(saved, days)
+            to_write: List[tuple[str, str]] = []
             if shared is None:
                 for ent, sched in zip(targets, saved):
                     for day in days:
-                        diffs = _diff_nodes(nodes, velair_api.blocks_to_nodes(sched.get(day) or []))
+                        diffs = _diff_nodes(
+                            nodes, velair_api.blocks_to_nodes(sched.get(day) or [])
+                        )
                         print(f"{ent} {day}:")
                         print("\n".join(diffs) if diffs else "  unchanged")
+                        if diffs:
+                            to_write.append((ent, day))
             else:
                 diffs = _diff_nodes(nodes, shared)
-                shown = ",".join(days) if label not in ("weekday", "weekend", "all_days") else label
+                shown = (
+                    ",".join(days)
+                    if label not in ("weekday", "weekend", "all_days")
+                    else label
+                )
                 if diffs:
                     print(f"{shown}:")
                     print("\n".join(diffs))
+                    for ent in targets:
+                        for day in days:
+                            to_write.append((ent, day))
                 else:
                     print(f"{shown}: unchanged")
             if dry:
                 continue
-            for ent in targets:
-                for day in days:
-                    result = velair_api.set_day(client, ent, day, blocks, revision)
-                    revision = _revision_from(result) or revision
+            for ent, day in to_write:
+                revision = _set_day_refreshing(client, ent, day, blocks, revision)
 
     # Seasonal climate profiles only on a normal apply (not --profile overlay).
     if profile is None and cfg.climate_profiles:

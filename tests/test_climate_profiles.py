@@ -23,14 +23,48 @@ from lib.resolve import resolve_day_nodes
 ROOT = Path(__file__).resolve().parents[1]
 
 
+_SEASON_SELECT = {
+    "type": "season_select",
+    "id": "velair_season_select",
+    "alias": "Velair season profile select",
+    "heating_season": "binary_sensor.heating_season",
+    "outdoor": "sensor.outdoor_temperature",
+    "labels": ["heating"],
+}
+
+
 @pytest.fixture
 def cfg() -> ScheduleConfig:
-    """Loaded schedule.yaml.
+    """Loaded schedule.yaml with climate_profiles forced on.
 
     Returns:
         ScheduleConfig.
     """
-    return load_config(ROOT / "schedule.yaml")
+    loaded = load_config(ROOT / "schedule.yaml")
+    raw_cp = dict(loaded.raw.get("climate_profiles") or {})
+    raw_cp.pop("enabled", None)
+    autos = dict(loaded.automations)
+    autos["season_select"] = dict(_SEASON_SELECT)
+    base = _with_profiles(loaded, raw_cp)
+    return ScheduleConfig(
+        path=base.path,
+        raw=base.raw,
+        version=base.version,
+        context=base.context,
+        specifiers=base.specifiers,
+        rules=base.rules,
+        reviews=base.reviews,
+        schedules=base.schedules,
+        profiles=base.profiles,
+        climate_profiles=base.climate_profiles,
+        groups=base.groups,
+        automations=autos,
+        legacy_disable=base.legacy_disable,
+        backup=base.backup,
+        collect=base.collect,
+        scheduler=base.scheduler,
+        expectations=base.expectations,
+    )
 
 
 def _with_profiles(cfg: ScheduleConfig, climate_profiles: dict) -> ScheduleConfig:

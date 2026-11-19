@@ -129,11 +129,14 @@ class FakeHaState:
         """
         zones = {}
         for eid, days in self.zones.items():
-            zones[eid] = {
+            zone: Dict[str, Any] = {
                 "enabled": True,
                 "schedule": {day: list(blocks) for day, blocks in days.items()},
                 "day_layout_key": "individual",
             }
+            if eid in self.steps:
+                zone["target_temp_step_override"] = self.steps[eid]
+            zones[eid] = zone
         return {
             "configuration_revision": self.revision,
             "configured_entities": list(CLIMATES),
@@ -415,6 +418,17 @@ class FakeHaServer:
                         self._json(200, [])
                         return
                     if domain == "velair" and service == "set_daily_schedule":
+                        expected = payload.get("expected_revision")
+                        if expected is not None and int(expected) != state.revision:
+                            self._json(
+                                500,
+                                {
+                                    "message": (
+                                        "Configuration changed; reload before saving"
+                                    )
+                                },
+                            )
+                            return
                         eid = str(payload.get("entity_id"))
                         weekday = str(payload.get("weekday"))
                         blocks = list(payload.get("blocks") or [])
@@ -505,6 +519,42 @@ class FakeHaServer:
                         state.steps[eid] = step
                         state.revision += 1
                         state.writes.append(f"temp_step {eid}={step}")
+                        self._ws_send(
+                            sock,
+                            {
+                                "id": msg_id,
+                                "type": "result",
+                                "success": True,
+                                "result": state.schedule_payload(),
+                            },
+                        )
+                        continue
+                    if mtype == "velair/set_daily_schedule":
+                        expected = msg.get("expected_revision")
+                        if expected is not None and int(expected) != state.revision:
+                            self._ws_send(
+                                sock,
+                                {
+                                    "id": msg_id,
+                                    "type": "result",
+                                    "success": False,
+                                    "error": {
+                                        "code": "revision_conflict",
+                                        "message": (
+                                            "Configuration changed; reload before saving"
+                                        ),
+                                    },
+                                },
+                            )
+                            continue
+                        eid = str(msg.get("entity_id"))
+                        weekday = str(msg.get("weekday"))
+                        blocks = list(msg.get("blocks") or [])
+                        stored = state.snap_blocks(eid, blocks)
+                        state.zones.setdefault(eid, {day: [] for day in DAYS})
+                        state.zones[eid][weekday] = stored
+                        state.revision += 1
+                        state.writes.append(f"set_daily_schedule {eid} {weekday}")
                         self._ws_send(
                             sock,
                             {
