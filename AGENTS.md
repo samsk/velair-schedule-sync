@@ -5,6 +5,9 @@ The goal: run several heating circuits on a heat pump so that heat goes
 in during the low-tariff window, or in hours when the outdoor temperature
 (and so COP) is higher, and the house then holds it through the day.
 
+New house without `schedule.yaml`? Follow [`SETUP.md`](SETUP.md) first:
+import from Home Assistant, then interview the user before writing config.
+
 ## Golden rules
 
 - `schedule.yaml` is the source of truth, not the Home Assistant UI. Read
@@ -46,6 +49,12 @@ in during the low-tariff window, or in hours when the outdoor temperature
    entity and day, and check the resolved clocks are what you meant.
 6. **Dry-run** `make apply`. The diff must touch only what you intended.
    Unchanged circuits and automations must stay unchanged.
+   Every schedule change reply shows: the new day timeline as a table (clock
+   by circuit), a before/after table per changed circuit and day, and the sum
+   of heat-hour change, split into in-LT and off-LT hours with signed deltas
+   (e.g. +1 h, −1 h). LT = any LT specifier window that day. Heat hour = hour
+   with setpoint above 15.5 °C (pool: on-hours). Degree-hours = sum of
+   (setpoint − 15.5) × hours.
 7. **Record.** Append a `reviews` entry: `period`, `results`, `verdict`,
    `changes`. Add `data_used` findings with the period and entities.
    Bump `context.updated`.
@@ -72,6 +81,9 @@ in view.
 - After editing, `show` every changed entity and every interacting
   circuit/automation for each affected day. Say which schedules stay
   unchanged and why the combined timeline is still safe.
+- Always show the new plan as tables: day timeline by circuit, before/after
+  clocks per changed circuit and day, and heat-hour change split into
+  in-LT and off-LT with signed deltas (see Dry-run step 6).
 - Record that cross-circuit conclusion in `reviews` / `data_used`.
 
 ## Tuning heuristics (heat pump houses)
