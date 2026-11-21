@@ -2,7 +2,25 @@
 
 from __future__ import annotations
 
-from lib.collect import aggregate, check_collect, compute_results, stat_ids
+from datetime import date, datetime
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+from lib.collect import (
+    aggregate,
+    aggregate_history,
+    check_collect,
+    clip_intervals,
+    compute_history_results,
+    compute_results,
+    history_entity_ids,
+    specifier_intervals,
+    stat_ids,
+)
+from lib.config import load_config
+from lib.history import Sample
+
+TZ = ZoneInfo("Europe/Bratislava")
 
 
 def test_aggregate_methods() -> None:
@@ -30,6 +48,18 @@ def test_stat_ids_dedupe() -> None:
         }
     }
     assert stat_ids(collect) == ["sensor.a", "sensor.b"]
+
+
+def test_history_entity_ids_dedupe() -> None:
+    """history_entity_ids returns unique entities."""
+    collect = {
+        "history_metrics": {
+            "m1": {"entity": "sensor.mod", "agg": "mean"},
+            "m2": {"entity": "sensor.out", "agg": "max"},
+            "m3": {"entity": "sensor.mod", "agg": "min"},
+        }
+    }
+    assert history_entity_ids(collect) == ["sensor.mod", "sensor.out"]
 
 
 def test_compute_results_ratio_list_den() -> None:
@@ -88,3 +118,169 @@ def test_check_collect_errors() -> None:
     assert any("unknown agg" in e for e in errs)
     assert any("missing stat" in e for e in errs)
     assert any("unknown num" in e for e in errs)
+
+
+def test_check_collect_history_errors() -> None:
+    """Schema errors for history_metrics windows and threshold."""
+    errs = check_collect(
+        {
+            "history_metrics": {
+                "mod": {"entity": "sensor.mod", "agg": "hours_at_or_above"},
+                "out": {
+                    "entity": "sensor.out",
+                    "agg": "mean",
+                    "windows": ["missing_win"],
+                },
+                "bad": {"agg": "mean"},
+            }
+        },
+        known_specifiers=["LT_weekend_morning"],
+    )
+    assert any("needs threshold" in e for e in errs)
+    assert any("unknown window" in e for e in errs)
+    assert any("missing entity" in e for e in errs)
+
+
+def _sample(stamp: str, value: float) -> Sample:
+    """Build a numeric history sample.
+
+    Args:
+        stamp: ISO timestamp.
+        value: Sensor value.
+    Returns:
+        Sample.
+    """
+    when = datetime.fromisoformat(stamp)
+    return Sample(when=when, state=str(value), actual=value, setpt=None, attrs={})
+
+
+def test_aggregate_history_mean_min_max_hours() -> None:
+    """Time-weighted aggs over clipped windows."""
+    samples = [
+        _sample("2026-11-21T02:00:00+01:00", 0.0),
+        _sample("2026-11-21T03:00:00+01:00", 50.0),
+        _sample("2026-11-21T04:00:00+01:00", 100.0),
+        _sample("2026-11-21T05:00:00+01:00", 100.0),
+    ]
+    intervals = [
+        (
+            datetime(2026, 11, 21, 2, 30, tzinfo=TZ),
+            datetime(2026, 11, 21, 4, 30, tzinfo=TZ),
+        )
+    ]
+    # 02:30-03:00 @0 (0.5h), 03:00-04:00 @50 (1h), 04:00-04:30 @100 (0.5h)
+    mean = aggregate_history(samples, intervals, "mean")
+    assert mean is not None
+    assert abs(mean - 50.0) < 1e-6
+    assert aggregate_history(samples, intervals, "min") == 0.0
+    assert aggregate_history(samples, intervals, "max") == 100.0
+    hours = aggregate_history(
+        samples, intervals, "hours_at_or_above", threshold=95.0
+    )
+    assert hours is not None
+    assert abs(hours - 0.5) < 1e-6
+
+
+def test_clip_and_specifier_intervals(tmp_path: Path) -> None:
+    """Specifier windows expand and clip to collect bounds."""
+    path = tmp_path / "cfg.yaml"
+    path.write_text(
+        "\n".join(
+            [
+                "version: 1",
+                "specifiers:",
+                "  weekend_LT_early:",
+                "    days: [sat, sun]",
+                "    start: '02:30'",
+                "    end: '04:00'",
+                "schedules: {}",
+                "rules: {disable: null, user: []}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    cfg = load_config(path)
+    intervals = specifier_intervals(
+        cfg, "weekend_LT_early", date(2026, 11, 21), date(2026, 11, 22), TZ
+    )
+    assert len(intervals) == 2
+    assert intervals[0][0] == datetime(2026, 11, 21, 2, 30, tzinfo=TZ)
+    clipped = clip_intervals(
+        intervals,
+        datetime(2026, 11, 21, 3, 0, tzinfo=TZ),
+        datetime(2026, 11, 21, 12, 0, tzinfo=TZ),
+    )
+    assert clipped == [
+        (
+            datetime(2026, 11, 21, 3, 0, tzinfo=TZ),
+            datetime(2026, 11, 21, 4, 0, tzinfo=TZ),
+        )
+    ]
+
+
+def test_compute_history_results(tmp_path: Path) -> None:
+    """compute_history_results merges windowed metrics."""
+    path = tmp_path / "cfg.yaml"
+    path.write_text(
+        "\n".join(
+            [
+                "version: 1",
+                "specifiers:",
+                "  LT_window:",
+                "    days: [sat]",
+                "    start: '02:30'",
+                "    end: '08:15'",
+                "schedules: {}",
+                "rules: {disable: null, user: []}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    cfg = load_config(path)
+    collect = {
+        "history_metrics": {
+            "mod_mean": {
+                "entity": "sensor.mod",
+                "agg": "mean",
+                "windows": ["LT_window"],
+            },
+            "mod_high_h": {
+                "entity": "sensor.mod",
+                "agg": "hours_at_or_above",
+                "threshold": 95,
+                "windows": ["LT_window"],
+            },
+        }
+    }
+    histories = {
+        "sensor.mod": [
+            {
+                "entity_id": "sensor.mod",
+                "state": "0",
+                "attributes": {},
+                "last_changed": "2026-11-21T02:00:00+01:00",
+                "last_updated": "2026-11-21T02:00:00+01:00",
+            },
+            {
+                "entity_id": "sensor.mod",
+                "state": "99",
+                "attributes": {},
+                "last_changed": "2026-11-21T05:30:00+01:00",
+                "last_updated": "2026-11-21T05:30:00+01:00",
+            },
+        ]
+    }
+    out = compute_history_results(
+        cfg,
+        collect,
+        histories,
+        since=date(2026, 11, 21),
+        until=date(2026, 11, 21),
+        bound_start=datetime(2026, 11, 21, 0, 0, tzinfo=TZ),
+        bound_end=datetime(2026, 11, 21, 12, 0, tzinfo=TZ),
+        tz=TZ,
+    )
+    assert out["mod_mean"] is not None
+    assert out["mod_high_h"] is not None
+    # 02:30-05:30 @0 (3h) + 05:30-08:15 @99 (2.75h)
+    assert abs(out["mod_high_h"] - 2.75) < 1e-6

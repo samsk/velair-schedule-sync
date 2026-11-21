@@ -13,7 +13,13 @@ from typing import Any, Dict, List, Optional
 import yaml
 
 from lib import cs_api, velair_api
-from lib.collect import check_collect, compute_results, stat_ids
+from lib.collect import (
+    check_collect,
+    compute_history_results,
+    compute_results,
+    history_entity_ids,
+    stat_ids,
+)
 from lib.config import ScheduleConfig, climate_entities, load_config, save_config
 from lib.ha import HaClient, load_connection
 from lib.lint import exit_code, validate
@@ -1159,6 +1165,69 @@ def _apply_automations(cfg: ScheduleConfig, client: HaClient, dry: bool) -> None
             raise RuntimeError(f"automations.{name}: unknown type {atype!r}")
 
 
+def cmd_compare(args: argparse.Namespace) -> int:
+    """Compare resolved schedule temps to HA history.
+
+    Args:
+        args: CLI args.
+    Returns:
+        Exit code.
+    """
+    from lib.history import (
+        DEFAULT_ACTUAL_ATTR,
+        DEFAULT_SETPT_ATTR,
+        compare_day,
+        compare_override,
+        day_window,
+        format_compare_table,
+        history_entity_id,
+        local_tz,
+        parse_date,
+        parse_history,
+    )
+
+    cfg = _cfg(args.config)
+    if not args.entity:
+        print("need --entity", file=sys.stderr)
+        return 2
+    key = args.entity
+    on_date = parse_date(args.date)
+    day = args.day
+    if day == "all":
+        # Map calendar weekday to mon..sun token.
+        day = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")[on_date.weekday()]
+    days = expand_days(day)
+    if len(days) != 1:
+        print("compare needs one day (mon..sun or weekday/weekend alias of one)", file=sys.stderr)
+        return 2
+    day = days[0]
+
+    override = compare_override(cfg, key)
+    hist_entity = str(override.get("entity") or history_entity_id(cfg, key))
+    actual_attr = str(override.get("actual_attr") or DEFAULT_ACTUAL_ATTR)
+    setpt_attr = str(override.get("setpt_attr") or DEFAULT_SETPT_ATTR)
+    tz_name = override.get("timezone")
+    zone = local_tz(str(tz_name) if tz_name else None)
+    start, end = day_window(on_date, tz=zone, end_now_if_today=True)
+
+    client = load_connection(args.url, args.token, ROOT)
+    client.allow_writes = False
+    try:
+        raw = client.history(
+            hist_entity,
+            start.isoformat(),
+            end.isoformat(),
+        )
+    except Exception as exc:
+        print(f"history error: {exc}", file=sys.stderr)
+        return 1
+    samples = parse_history(raw, actual_attr=actual_attr, setpt_attr=setpt_attr)
+    rows = compare_day(cfg, key, day, on_date, samples, tz=zone)
+    print(f"# compare {key} {day} {on_date.isoformat()} history={hist_entity}")
+    print(format_compare_table(rows, fmt=args.format), end="")
+    return 0
+
+
 def cmd_collect(args: argparse.Namespace) -> int:
     """Pull stats and append a reviews entry.
 
@@ -1167,33 +1236,73 @@ def cmd_collect(args: argparse.Namespace) -> int:
     Returns:
         Exit code.
     """
+    from zoneinfo import ZoneInfo
+
+    from lib.history import local_tz, parse_date
+
     cfg = _cfg(args.config)
     collect = cfg.collect or {}
-    errors = check_collect(collect)
+    errors = check_collect(collect, known_specifiers=list(cfg.specifiers))
     if errors:
         for err in errors:
             print(f"collect schema: {err}")
         return 1
     statistic_ids = stat_ids(collect)
-    if not statistic_ids:
-        print("no collect.metrics defined; nothing to collect")
+    hist_ids = history_entity_ids(collect)
+    if not statistic_ids and not hist_ids:
+        print("no collect.metrics or history_metrics defined; nothing to collect")
         return 1
     client = load_connection(args.url, args.token, ROOT)
     client.allow_writes = False
     since = args.since
-    end = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+    now_utc = datetime.now(timezone.utc)
+    end = now_utc.strftime("%Y-%m-%dT%H:%M:%S+00:00")
     start = f"{since}T00:00:00+00:00"
     period = str(collect.get("period") or "hour")
-    try:
-        stats = client.statistics(statistic_ids, start, end, period=period)
-    except Exception as exc:
-        print(f"statistics error: {exc}")
-        stats = {}
+    stats: Dict[str, Any] = {}
+    if statistic_ids:
+        try:
+            stats = client.statistics(statistic_ids, start, end, period=period)
+        except Exception as exc:
+            print(f"statistics error: {exc}")
+            stats = {}
 
     results = compute_results(collect, stats)
+
+    if hist_ids:
+        try:
+            ha_tz = str((client.get_config() or {}).get("time_zone") or "")
+        except Exception:
+            ha_tz = ""
+        zone = ZoneInfo(ha_tz) if ha_tz else local_tz()
+        since_d = parse_date(since)
+        until_d = now_utc.astimezone(zone).date()
+        bound_start = datetime.combine(since_d, datetime.min.time(), tzinfo=zone)
+        bound_end = now_utc.astimezone(zone)
+        histories: Dict[str, Any] = {}
+        for eid in hist_ids:
+            try:
+                histories[eid] = client.history(
+                    eid, bound_start.isoformat(), bound_end.isoformat()
+                )
+            except Exception as exc:
+                print(f"history error {eid}: {exc}")
+                histories[eid] = []
+        hist_results = compute_history_results(
+            cfg,
+            collect,
+            histories,
+            since=since_d,
+            until=until_d,
+            bound_start=bound_start,
+            bound_end=bound_end,
+            tz=zone,
+        )
+        results.update(hist_results)
+
     entry = {
-        "date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-        "period": f"{since}/{datetime.now(timezone.utc).strftime('%Y-%m-%d')}",
+        "date": now_utc.strftime("%Y-%m-%d"),
+        "period": f"{since}/{now_utc.strftime('%Y-%m-%d')}",
         "results": results,
         "verdict": None,
         "changes": None,
@@ -1239,6 +1348,13 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--profile", default=None)
     s.add_argument("--climate-profile", default=None)
     s.set_defaults(func=cmd_show)
+
+    cmp_ = sub.add_parser("compare", help="Compare schedule temps to HA history")
+    cmp_.add_argument("--entity", required=True)
+    cmp_.add_argument("--day", default="all", help="mon..sun, or all to use --date weekday")
+    cmp_.add_argument("--date", required=True, help="YYYY-MM-DD")
+    cmp_.add_argument("--format", choices=["ascii", "csv"], default="ascii")
+    cmp_.set_defaults(func=cmd_compare)
 
     b = sub.add_parser("backup", help="Backup live schedules")
     b.set_defaults(func=cmd_backup)

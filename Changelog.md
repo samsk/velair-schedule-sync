@@ -6,6 +6,16 @@ All notable changes to this project are documented in this file.
 
 ### Added
 
+- `collect.history_metrics`: windowed recorder-history aggregations
+  (`mean` / `min` / `max` / `hours_at_or_above`) merged into collect
+  reviews; schema validation and tests.
+- AGENTS guidance for compressor/pump modulation evidence, avoiding
+  idle-then-max load shape, and preferring warmer LT hours from measured
+  outdoor trends (no fixed inflection hour).
+- `compare` CLI / `make compare`: resolved schedule temps vs HA history
+  (live setpt and actual), with optional `collect.compare` overrides.
+- AGENTS whole-system scheduling rule: never tune one circuit in
+  isolation; check peer circuits and accumulation handoff.
 - Seasonal Velair `climate_profiles`: derive alternate weeks from Default
   (offset) or all-day holds (off season), with explicit priorities.
 - `season_select` automation type that picks `select.velair_mode` from

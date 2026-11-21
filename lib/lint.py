@@ -939,7 +939,9 @@ def lint_config_schema(cfg: ScheduleConfig) -> List[Finding]:
     from .collect import check_collect
 
     out: List[Finding] = []
-    for msg in check_collect(cfg.collect or {}):
+    for msg in check_collect(
+        cfg.collect or {}, known_specifiers=list(cfg.specifiers)
+    ):
         out.append(Finding("builtin", "config_schema", "error", "collect", "-", msg))
     for msg in schema_findings(cfg):
         out.append(

@@ -13,7 +13,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 
 @dataclass
@@ -142,6 +142,39 @@ class HaClient:
             if "404" in str(exc):
                 return None
             raise
+
+    def history(
+        self,
+        entity_id: str,
+        start: str,
+        end: str,
+        *,
+        significant_changes_only: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Fetch recorder history for one entity.
+
+        Args:
+            entity_id: Entity id.
+            start: ISO start timestamp.
+            end: ISO end timestamp.
+            significant_changes_only: Pass-through HA query flag.
+        Returns:
+            Flat list of history state dicts (empty when absent).
+        """
+        path = (
+            f"/api/history/period/{quote(start, safe='')}"
+            f"?filter_entity_id={quote(entity_id, safe='')}"
+            f"&end_time={quote(end, safe='')}"
+        )
+        if significant_changes_only:
+            path += "&significant_changes_only=1"
+        raw = self.get(path)
+        if not isinstance(raw, list) or not raw:
+            return []
+        first = raw[0]
+        if isinstance(first, list):
+            return [row for row in first if isinstance(row, dict)]
+        return [row for row in raw if isinstance(row, dict)]
 
     def get_services(self) -> Dict[str, Any]:
         """List available services.

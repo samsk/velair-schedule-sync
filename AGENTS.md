@@ -30,6 +30,9 @@ in during the low-tariff window, or in hours when the outdoor temperature
    `design_notes`, `expectations`, the last few `reviews`.
 2. **Measure.** Run `make collect ARGS='--since <date> --dry-run'` first;
    drop `--dry-run` to append a review. Compare against `expectations`.
+   For room under/overshoot, run
+   `make compare ARGS='--entity <climate> --day <day> --date YYYY-MM-DD'`
+   (sched vs live setpt vs actual).
 3. **Diagnose** before editing. Check the hour-by-hour story, not just
    daily totals: setpoints, supply and tank temps, pump modulation, heat
    pump mode, outdoor temp. Recorder statistics and history are fine for
@@ -37,7 +40,8 @@ in during the low-tariff window, or in hours when the outdoor temperature
 4. **Note confounders** in `data_used.findings`: a house preheated before
    a deploy, a cold snap, a DHW cycle, a missed day. One day of data is a
    hint, not a verdict.
-5. **Change** yaml with the edit style below. Then run
+5. **Change** yaml with the edit style below. Never tune one circuit in
+   isolation — see Whole-system scheduling. Then run
    `make validate ARGS='--strict'` and `make show` for each touched
    entity and day, and check the resolved clocks are what you meant.
 6. **Dry-run** `make apply`. The diff must touch only what you intended.
@@ -46,6 +50,29 @@ in during the low-tariff window, or in hours when the outdoor temperature
    `changes`. Add `data_used` findings with the period and entities.
    Bump `context.updated`.
 8. **Apply** only when asked, then tell the user the backup path.
+
+## Whole-system scheduling
+
+Never edit one heating circuit without the rest of the heat-source timeline
+in view.
+
+- Identify roles from `context.entity_roles` / `context.house` (floors,
+  radiators, accumulation/buffer, DHW, HVAC, pool). Do not assume entity
+  names.
+- Before changing a day, `show` that day for every circuit that shares the
+  heat pump, plus DHW / high-temp automations that can stack load.
+- If an accumulation (buffer) circuit exists, preserve the handoff: room
+  preheat first, buffer charge last in the cheap window. State the
+  handoff clocks explicitly when you change a peer circuit.
+- If there is no accumulation circuit, still check every other circuit on
+  the same heat source; skip only buffer-specific checks.
+- Check proposed high-demand intervals against `no_overlap_above`, DHW
+  duration, tariff windows, and backup-heater risk. A green `validate` is
+  necessary but not enough — walk the hour-by-hour combined timeline.
+- After editing, `show` every changed entity and every interacting
+  circuit/automation for each affected day. Say which schedules stay
+  unchanged and why the combined timeline is still safe.
+- Record that cross-circuit conclusion in `reviews` / `data_used`.
 
 ## Tuning heuristics (heat pump houses)
 
@@ -65,6 +92,16 @@ in during the low-tariff window, or in hours when the outdoor temperature
   outdoor temperature.
 - Judge results by energy per heating degree hour (kWh/HDH), COP and
   backup-heater kWh, not by raw kWh. Weather changes raw kWh.
+- Treat compressor modulation and circuit-pump modulation as standard
+  before/after evidence (`collect.history_metrics` or history reads).
+  Avoid schedules that leave cheap or warmer hours idle and then compress
+  demand into sustained 95–100% modulation later.
+- Check the measured outdoor trajectory inside candidate tariff windows;
+  prefer warmer hours for COP when repeated evidence supports it. Never
+  assume a fixed local inflection hour, and do not optimize from one day
+  alone — record variability and confounders in `data_used`.
+- Preserve whole-system handoffs and overlap rules before shifting load
+  earlier in a window.
 
 ## Config layout (`schedule.yaml`)
 
@@ -89,6 +126,16 @@ Start a new house from `schedule.example.yaml`.
   Ratios use `num` / `den`; `den` may be a list to sum. A missing or zero
   `den` gives `null`. Check which agg fits a sensor by looking at its raw
   statistic rows before trusting a number.
+  Optional `collect.compare.<entity>` overrides history entity / attrs for
+  `make compare` (defaults: climate entity, `current_temperature` /
+  `temperature`).
+  Optional `collect.history_metrics` pulls recorder history (not long-term
+  statistics) for sensors such as modulation. Each entry needs `entity`
+  and `agg` (`mean`, `min`, `max`, `hours_at_or_above` with `threshold`).
+  Optional `windows` is a list of specifier names; intervals use the HA
+  timezone from `/api/config`. Omit `windows` to use the full
+  `--since`..now span. Results merge into the same `collect` review
+  output as statistic metrics.
 - `scheduler` — optional `{status_sensor, paused_state}` for `test`.
 - `groups`, `profiles`, `climate_profiles`, `automations`,
   `legacy_disable`, `backup`.
@@ -194,6 +241,7 @@ All commands run in docker via `make` (`docker compose`).
 make validate ARGS='--strict'
 make show ARGS='--entity climate.hc1 --day mon'
 make show ARGS='--climate-profile cold --entity climate.hc2 --day mon'
+make compare ARGS='--entity climate.hc2 --day sat --date 2026-11-21'
 make check                          # offline pytest + fake HA
 make test                           # HA connection, read-only
 make collect ARGS='--since <date> --dry-run'

@@ -214,6 +214,28 @@ collect:
     kwh_per_hdh:
       num: consumed_kwh
       den: hdh
+  # Optional overrides for `make compare` (defaults: climate entity attrs).
+  # compare:
+  #   climate.radiators:
+  #     entity: climate.radiators
+  #     actual_attr: current_temperature
+  #     setpt_attr: temperature
+  # History metrics use recorder history (not long-term statistics).
+  # Optional windows list uses schedule specifier names; omit for full since..now.
+  # history_metrics:
+  #   compressor_mod_mean:
+  #     entity: sensor.actual_modulation
+  #     agg: mean
+  #     windows: [LT_weekend]
+  #   compressor_mod_high_h:
+  #     entity: sensor.actual_modulation
+  #     agg: hours_at_or_above
+  #     threshold: 95
+  #     windows: [LT_weekend]
+  #   outdoor_lt_mean:
+  #     entity: sensor.outdoor_temperature
+  #     agg: mean
+  #     windows: [LT_weekend]
 # Optional Velair seasonal profiles. schedules stay Default; Home Assistant
 # selects select.velair_mode by priority. Off season must be highest.
 climate_profiles:

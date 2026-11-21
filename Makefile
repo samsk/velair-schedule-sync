@@ -10,7 +10,7 @@ RUN := $(COMPOSE) run --rm --volume $(ROOT):/app velair
 PYTEST := $(COMPOSE) run --rm --volume $(ROOT):/app --entrypoint python velair -m pytest
 ARGS ?=
 
-.PHONY: help build validate show test backup restore apply apply-yes collect fixtures check ha-up ha-down test-ha
+.PHONY: help build validate show compare test backup restore apply apply-yes collect fixtures check ha-up ha-down test-ha
 
 help: ## list targets
 	@grep -E '^[a-zA-Z0-9_-]+:.*?##' $(MAKEFILE_LIST) | \
@@ -24,6 +24,9 @@ validate: ## lint schedule offline
 
 show: ## show resolved schedule (ARGS=--entity climate.hc1 --day weekday)
 	$(RUN) show $(ARGS)
+
+compare: ## schedule vs history (ARGS=--entity climate.hc2 --day sat --date YYYY-MM-DD)
+	$(RUN) compare $(ARGS)
 
 test: ## check HA connection
 	$(RUN) test $(ARGS)

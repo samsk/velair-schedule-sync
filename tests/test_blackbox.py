@@ -31,13 +31,15 @@ def fake_ha():
         server.stop()
 
 
-def _run_apply(config: Path, url: str, *extra: str) -> subprocess.CompletedProcess[str]:
-    """Run sync.py apply against a URL.
+def _run_sync(
+    config: Path, url: str, *args: str
+) -> subprocess.CompletedProcess[str]:
+    """Run sync.py against a URL.
 
     Args:
         config: Schedule path.
         url: Fake HA URL.
-        extra: Extra CLI args after apply.
+        args: Subcommand and flags.
     Returns:
         Completed process.
     """
@@ -50,10 +52,118 @@ def _run_apply(config: Path, url: str, *extra: str) -> subprocess.CompletedProce
         url,
         "--token",
         TOKEN,
-        "apply",
-        *extra,
+        *args,
     ]
     return subprocess.run(cmd, cwd=str(ROOT), capture_output=True, text=True, check=False)
+
+
+def _run_apply(config: Path, url: str, *extra: str) -> subprocess.CompletedProcess[str]:
+    """Run sync.py apply against a URL.
+
+    Args:
+        config: Schedule path.
+        url: Fake HA URL.
+        extra: Extra CLI args after apply.
+    Returns:
+        Completed process.
+    """
+    return _run_sync(config, url, "apply", *extra)
+
+
+def test_compare_prints_schedule_vs_history(
+    fake_ha: FakeHaServer, tmp_path: Path
+) -> None:
+    """compare prints sched/setpt/actual columns from HA history."""
+    config = tmp_path / "house_mini.yaml"
+    shutil.copy(FIXTURE, config)
+    result = _run_sync(
+        config,
+        fake_ha.url,
+        "compare",
+        "--entity",
+        "climate.hc1",
+        "--day",
+        "sat",
+        "--date",
+        "2026-11-21",
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "compare climate.hc1 sat 2026-11-21" in result.stdout
+    assert "sched" in result.stdout
+    assert "actual" in result.stdout
+
+
+def test_collect_history_metrics_dry_run(
+    fake_ha: FakeHaServer, tmp_path: Path
+) -> None:
+    """collect dry-run includes windowed history_metrics."""
+    config = tmp_path / "house_mini.yaml"
+    shutil.copy(FIXTURE, config)
+    data = yaml.safe_load(config.read_text())
+    data["specifiers"]["weekend_LT_early"] = {
+        "days": ["sat", "sun"],
+        "start": "02:30",
+        "end": "04:00",
+    }
+    data["collect"]["history_metrics"] = {
+        "mod_mean": {
+            "entity": "sensor.actual_modulation",
+            "agg": "mean",
+            "windows": ["LT_weekend_morning"],
+        },
+        "mod_high_h": {
+            "entity": "sensor.actual_modulation",
+            "agg": "hours_at_or_above",
+            "threshold": 95,
+            "windows": ["LT_weekend_morning"],
+        },
+        "outdoor_early": {
+            "entity": "sensor.outdoor_temperature",
+            "agg": "mean",
+            "windows": ["weekend_LT_early"],
+        },
+    }
+    config.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    fake_ha.state.history["sensor.actual_modulation"] = [
+        {
+            "entity_id": "sensor.actual_modulation",
+            "state": "0",
+            "attributes": {},
+            "last_changed": "2026-11-21T02:00:00+01:00",
+            "last_updated": "2026-11-21T02:00:00+01:00",
+        },
+        {
+            "entity_id": "sensor.actual_modulation",
+            "state": "99",
+            "attributes": {},
+            "last_changed": "2026-11-21T05:30:00+01:00",
+            "last_updated": "2026-11-21T05:30:00+01:00",
+        },
+    ]
+    fake_ha.state.history["sensor.outdoor_temperature"] = [
+        {
+            "entity_id": "sensor.outdoor_temperature",
+            "state": "8.5",
+            "attributes": {},
+            "last_changed": "2026-11-21T02:30:00+01:00",
+            "last_updated": "2026-11-21T02:30:00+01:00",
+        },
+        {
+            "entity_id": "sensor.outdoor_temperature",
+            "state": "5.0",
+            "attributes": {},
+            "last_changed": "2026-11-21T04:00:00+01:00",
+            "last_updated": "2026-11-21T04:00:00+01:00",
+        },
+    ]
+    result = _run_sync(
+        config, fake_ha.url, "collect", "--since", "2026-11-21", "--dry-run"
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "mod_mean" in result.stdout
+    assert "mod_high_h" in result.stdout
+    assert "outdoor_early" in result.stdout
+    assert "dry-run: reviews not written" in result.stdout
 
 
 def test_apply_dry_run_zero_writes(fake_ha: FakeHaServer, tmp_path: Path) -> None:

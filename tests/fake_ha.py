@@ -120,6 +120,7 @@ class FakeHaState:
         self.modes: Dict[str, Dict[str, Any]] = {}
         self.active_profile_ids: List[str] = []
         self.forbidden_calls: List[str] = []
+        self.history: Dict[str, List[Dict[str, Any]]] = {}
 
     def schedule_payload(self) -> Dict[str, Any]:
         """Build velair/get_schedule result.
@@ -235,12 +236,20 @@ class FakeHaServer:
                 if not self._auth_ok():
                     self._json(401, {"message": "Unauthorized"})
                     return
-                path = urlparse(self.path).path
+                parsed = urlparse(self.path)
+                path = parsed.path
                 if path in ("/api/", "/api"):
                     self._json(200, {"message": "API running."})
                     return
                 if path == "/api/config":
-                    self._json(200, {"version": "2026.11.1", "location_name": "fake"})
+                    self._json(
+                        200,
+                        {
+                            "version": "2026.11.1",
+                            "location_name": "fake",
+                            "time_zone": "Europe/Bratislava",
+                        },
+                    )
                     return
                 if path == "/api/services":
                     self._json(
@@ -342,6 +351,41 @@ class FakeHaServer:
                         self.end_headers()
                         return
                     self._json(200, conf)
+                    return
+                if path.startswith("/api/history/period/"):
+                    qs = parse_qs(parsed.query)
+                    eids = (qs.get("filter_entity_id") or [""])[0].split(",")
+                    series: List[List[Dict[str, Any]]] = []
+                    for eid in eids:
+                        eid = eid.strip()
+                        if not eid:
+                            continue
+                        rows = list(state.history.get(eid) or [])
+                        if not rows and eid in CLIMATES:
+                            rows = [
+                                {
+                                    "entity_id": eid,
+                                    "state": "heat",
+                                    "attributes": {
+                                        "current_temperature": 20.8,
+                                        "temperature": 21.5,
+                                    },
+                                    "last_changed": "2026-11-21T04:45:00+01:00",
+                                    "last_updated": "2026-11-21T04:45:00+01:00",
+                                },
+                                {
+                                    "entity_id": eid,
+                                    "state": "heat",
+                                    "attributes": {
+                                        "current_temperature": 20.8,
+                                        "temperature": 20.5,
+                                    },
+                                    "last_changed": "2026-11-21T06:15:00+01:00",
+                                    "last_updated": "2026-11-21T06:15:00+01:00",
+                                },
+                            ]
+                        series.append(rows)
+                    self._json(200, series)
                     return
                 self.send_response(404)
                 self.end_headers()
